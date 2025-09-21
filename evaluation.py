@@ -1,160 +1,127 @@
-# evaluation.py
-#
-# This script loads the saved simulation results, calculates evaluation metrics,
-# and generates plots and tables for the manuscript.
-# -----------------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+evaluation.py
 
+Loads results, calculates metrics, and generates summary tables.
+Now includes AMSE Ratio and Time-Normalized MSE (TNMSE).
+All content is in English.
+"""
 import os
 import pickle
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from config import SIM_RESULTS_DIR, ANALYSIS_RESULTS_DIR, scenarios
+import config
 
-def load_results():
-    """Load all simulation results into a single pandas DataFrame."""
-    results = []
-    if not os.path.exists(SIM_RESULTS_DIR):
-        return pd.DataFrame(results)
+def load_results(results_dir, scenarios):
+    """Loads simulation results from a specific directory into a pandas DataFrame."""
+    # ... (code from previous turn, no changes needed here)
+    results_list = []
+    if not os.path.exists(results_dir):
+        print(f"Error: Results directory '{results_dir}' not found.")
+        return pd.DataFrame()
 
-    for scenario_name in os.listdir(SIM_RESULTS_DIR):
-        scenario_dir = os.path.join(SIM_RESULTS_DIR, scenario_name)
-        if not os.path.isdir(scenario_dir) or scenario_name not in scenarios:
-            continue
-            
-        true_beta_scenario = scenarios[scenario_name]['params']['true_beta']
-        
+    for scenario_name in os.listdir(results_dir):
+        scenario_dir = os.path.join(results_dir, scenario_name)
+        if not os.path.isdir(scenario_dir): continue
+
+        true_ate = np.nan
         for file_name in os.listdir(scenario_dir):
-            if file_name.endswith(".pkl"):
+             if file_name.endswith(".pkl"):
                 try:
-                    parts = file_name.replace(".pkl", "").split("_")
-                    sim_id = int(parts[1])
-                    method_name = parts[3]
-                    
                     with open(os.path.join(scenario_dir, file_name), 'rb') as f:
-                        res = pickle.load(f)
-                    
-                    # Skip if result is malformed or contains NaNs
-                    if 'point_est' not in res or np.isnan(res['point_est']).any():
-                        continue
-                        
-                    # Calculate squared error for the first parameter (theta_1)
-                    squared_error_theta1 = (res['point_est'][0] - true_beta_scenario[0])**2
-                    
-                    ci_width = np.mean(res['ci_upper'] - res['ci_lower'])
-                    # Coverage for the first, most prominent parameter
-                    coverage = (res['ci_lower'][0] <= true_beta_scenario[0]) and \
-                               (res['ci_upper'][0] >= true_beta_scenario[0])
-                    
-                    results.append({
-                        "scenario": scenario_name,
-                        "sim_id": sim_id,
-                        "method": method_name,
-                        "squared_error_theta1": squared_error_theta1,
-                        "ci_width": ci_width,
-                        "coverage": int(coverage),
-                        "running_time": res['running_time']
-                    })
-                except (IOError, pickle.PickleError, IndexError) as e:
-                    print(f"Warning: Could not process file {file_name}. Reason: {e}")
-    
-    return pd.DataFrame(results)
+                        res_sample = pickle.load(f)
+                        true_ate = res_sample.get('true_ate', np.nan)
+                        break 
+                except Exception:
+                    continue
 
-def generate_summary_table(df):
-    """Generate a LaTeX summary table of the results."""
-    # Define a custom aggregation for RMSE
-    def rmse(x):
-        return np.sqrt(x.mean())
+        for file_name in os.listdir(scenario_dir):
+            if not file_name.endswith(".pkl"): continue
+            
+            try:
+                with open(os.path.join(scenario_dir, file_name), 'rb') as f:
+                    res = pickle.load(f)
+                
+                est_ate, ci_lower, ci_upper = res.get('est_ate'), res.get('ci_lower'), res.get('ci_upper')
+                
+                if est_ate is not None and not np.isnan(est_ate) and ci_lower is not None and not np.isnan(ci_lower):
+                    res_dict = {
+                        "scenario": res.get('scenario'), "method": res.get('method'),
+                        "Coverage": (ci_lower <= true_ate) and (true_ate <= ci_upper),
+                        "CI_Width": ci_upper - ci_lower, "Bias": est_ate - true_ate,
+                        "Sq_Error": (est_ate - true_ate)**2,
+                        "Runtime": res.get('runtime', 0)
+                    }
+                    if 'pilot_ratio' in res: res_dict['pilot_ratio'] = res['pilot_ratio']
+                    if 'misspecification' in res: res_dict['misspecification'] = res['misspecification']
+                    results_list.append(res_dict)
+            except Exception as e:
+                print(f"Warning: Could not process {file_name}. Reason: {e}")
 
-    summary = df.groupby(['scenario', 'method']).agg(
-        RMSE_theta1=('squared_error_theta1', rmse),
-        CI_Width=('ci_width', 'mean'),
-        Coverage=('coverage', 'mean'),
-        Time=('running_time', 'mean')
+    return pd.DataFrame(results_list)
+
+
+def generate_summary_table(df, experiment_name):
+    """Generates a summary table with standard and new efficiency metrics."""
+    if df.empty: return None
+        
+    grouping_vars = ['scenario', 'method']
+    if 'pilot_ratio' in df.columns: grouping_vars = ['pilot_ratio', 'method', 'scenario']
+    if 'misspecification' in df.columns: grouping_vars = ['misspecification', 'method']
+
+    summary = df.groupby(grouping_vars).agg(
+        Coverage=('Coverage', 'mean'), 
+        CI_Width=('CI_Width', 'mean'),
+        Bias=('Bias', 'mean'), 
+        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
+        Runtime=('Runtime', 'mean')
     ).reset_index()
     
-    # Format for LaTeX
-    summary_latex = summary.to_latex(
-        index=False,
-        float_format="%.3f",
-        caption="Summary of Simulation Results across Scenarios and Methods.",
-        label="tab:summary",
-        column_format="llrrrr"
-    )
+    # --- New Metrics ---
+    if 'method' in summary.columns and 'scenario' in summary.columns and experiment_name == "experiment_2_main_comparison":
+        # 1. AMSE Ratio (using RMSE as a proxy for asymptotic variance)
+        unif_rmse = summary[summary['method'] == 'UNIF'].set_index('scenario')['RMSE']
+        summary['AMSE_Ratio'] = summary.apply(
+            lambda row: (unif_rmse.get(row['scenario'], np.nan) / row['RMSE'])**2 if row['method'] != 'UNIF' else 1.0,
+            axis=1
+        )
+        
+        # 2. Time-Normalized MSE (TNMSE)
+        summary['TNMSE'] = summary['RMSE']**2 * summary['Runtime']
+
+    analysis_dir = f"./analysis_results/{experiment_name}"
+    os.makedirs(analysis_dir, exist_ok=True)
     
-    table_path = os.path.join(ANALYSIS_RESULTS_DIR, "summary_table.tex")
-    with open(table_path, "w") as f:
-        f.write(summary_latex)
-    print(f"Summary table saved to {table_path}")
+    method_order = ['OS', 'UNIF', 'LSS', 'FULL']
+    if 'method' in summary.columns:
+        summary['method'] = pd.Categorical(summary['method'], categories=method_order, ordered=True)
+        summary = summary.sort_values(grouping_vars)
+    
+    table_path = os.path.join(analysis_dir, "summary_table.csv")
+    summary.to_csv(table_path, index=False, float_format="%.4f")
+    print(f"\nSummary table saved to {table_path}")
     return summary
 
-def generate_plots(df):
-    """Generate improved boxplots for each metric, faceted by scenario."""
-    
-    # Calculate RMSE from squared error
-    df['rmse_theta1'] = np.sqrt(df['squared_error_theta1'])
-    metrics = ['rmse_theta1', 'ci_width', 'coverage', 'running_time']
-    metric_titles = {
-        'rmse_theta1': 'RMSE for Theta 1',
-        'ci_width': 'Average CI Width',
-        'coverage': 'Coverage Rate for Theta 1',
-        'running_time': 'Running Time (seconds)'
-    }
-    
-    scenarios_list = sorted(df['scenario'].unique())
-    n_scenarios = len(scenarios_list)
-    n_cols = 3
-    n_rows = (n_scenarios + n_cols - 1) // n_cols
-
-    for metric in metrics:
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 6, n_rows * 5), squeeze=False)
-        axes = axes.flatten()
-
-        for i, scenario_name in enumerate(scenarios_list):
-            ax = axes[i]
-            scenario_df = df[df['scenario'] == scenario_name]
-            
-            sns.boxplot(x='method', y=metric, data=scenario_df, ax=ax, palette="viridis")
-            ax.set_title(scenario_name.replace('_', ' ').title(), fontsize=12)
-            ax.set_xlabel('')
-            ax.set_ylabel(metric_titles[metric])
-            ax.tick_params(axis='x', rotation=45)
-            
-        # Hide unused subplots
-        for i in range(n_scenarios, len(axes)):
-            fig.delaxes(axes[i])
-            
-        fig.suptitle(f'Comparison of Methods: {metric_titles[metric]}', fontsize=18, y=1.02)
-        plt.tight_layout(rect=[0, 0, 1, 0.98])
-        
-        plot_path = os.path.join(ANALYSIS_RESULTS_DIR, f"plot_{metric}.png")
-        plt.savefig(plot_path, dpi=300)
-        plt.close()
-        print(f"Plot saved to {plot_path}")
-
 def main():
-    """Main function to run the evaluation."""
-    print("Loading simulation results...")
-    results_df = load_results()
+    """Main function to run the evaluation for all experiments."""
+    scenarios, _, experiments = config.get_experiments()
     
-    if results_df.empty:
-        print("Simulation results directory is empty or contains no valid results. Please run simulation.ipynb first.")
-        return
+    for exp_name, exp_config in experiments.items():
+        print(f"\n--- Evaluating: {exp_name} ---")
+        results_df = load_results(exp_config['base_dir'], scenarios)
+        
+        if results_df.empty:
+            print(f"No valid simulation results found for '{exp_name}'.")
+            continue
 
-    # Create analysis directory if it doesn't exist
-    if not os.path.exists(ANALYSIS_RESULTS_DIR):
-        os.makedirs(ANALYSIS_RESULTS_DIR)
+        print("Generating summary table...")
+        summary_table = generate_summary_table(results_df, exp_name)
+        
+        if summary_table is not None:
+            print(f"\n--- {exp_name} Summary Table ---")
+            print(summary_table.to_string(index=False, float_format="%.4f"))
 
-    print("\nGenerating summary table...")
-    summary_table = generate_summary_table(results_df)
-    print("\n--- Summary Table ---")
-    print(summary_table.to_string())
-    
-    print("\nGenerating plots...")
-    generate_plots(results_df)
-    
-    print(f"\nEvaluation complete. Results are in the '{ANALYSIS_RESULTS_DIR}' directory.")
+    print(f"\nEvaluation complete.")
 
 if __name__ == "__main__":
     main()
