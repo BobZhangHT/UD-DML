@@ -4,3 +4,5 @@
 .Ruserdata
 ./simulation_results
 ./analysis_results
+./ipynb_checkpoints
+./__pycache__
