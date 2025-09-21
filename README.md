@@ -1,1 +1,1 @@
-# OS_DML: Optimal Subsampling for Double Machine Learning
+# OS-DML: Optimal Subsampling for Double Machine Learning
