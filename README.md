@@ -1,2 +1,1 @@
-# OBS
-Optimal Bayesian Subsampling
+# OS_DML: Optimal Subsampling for Double Machine Learning
