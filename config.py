@@ -18,7 +18,7 @@ import methods
 # =============================================================================
 BASE_SEED = 20250919
 N_SIM = 50  # Monte Carlo replications (use 1000 for a full study)
-N_POPULATION = 100_000 # Population size N
+N_POPULATION = 100000 # Population size N
 K_FOLDS = 2 # Number of folds for cross-fitting
 
 # =============================================================================

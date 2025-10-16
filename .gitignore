@@ -11,6 +11,8 @@ __pycache__/
 *.pyd
 .Python
 
+*.pdf
+
 # Jupyter Notebook
 .ipynb_checkpoints/
 *.ipynb_checkpoints
