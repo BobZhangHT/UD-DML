@@ -112,7 +112,8 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
     
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=config.BASE_SEED)
     
-    lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 100, 'num_leaves': 31}
+    lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 100, 
+                   'num_leaves': 31, 'verbose': -1}
     p_half = X.shape[1] // 2
 
     for train_idx, test_idx in kf.split(X):
@@ -268,10 +269,10 @@ def run_unif(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
 
 def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwargs):
     """
-    Generic helper for two-phase PPS methods (OS-DML and LSS).
+    Two-phase optimal subsampling pipeline for OS-DML (Algorithm 1).
     
-    Implements Algorithm 1 from the OS-DML paper for OS-DML,
-    and similar two-phase procedure for LSS.
+    Implements Algorithm 1 from the OS-DML paper.
+    Note: LSS now uses single-stage sampling (see run_lss function).
     
     Args:
         X, W, Y_obs: Full population data
@@ -279,7 +280,7 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
         is_rct: Whether the data comes from RCT
         r: Dictionary with 'r0' (pilot size) and 'r1' (main subsample size)
         k_folds: Number of folds for cross-fitting
-        pps_type: Either 'OS' or 'LSS'
+        pps_type: Should be 'OS' (kept for backward compatibility)
         **kwargs: Additional arguments including 'delta' and 'misspecification'
     
     Returns:
@@ -300,7 +301,8 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     X_pilot, W_pilot, Y_pilot = X[pilot_idx], W[pilot_idx], Y_obs[pilot_idx]
     
     # Step 2: Fit cross-fitted nuisance models η^(0) on pilot data
-    lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 30}
+    lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 30, 
+                         'verbose': -1}
     
     mu0_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
         X_pilot[W_pilot == 0], Y_pilot[W_pilot == 0])
@@ -321,29 +323,11 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     # φ_i^(0) = φ(Z_i; η^(0)) for all i
     phi_pilot_full = _orthogonal_score(Y_obs, W, mu0_full, mu1_full, e_full)
 
-    # Construct sampling probabilities based on method type
-    if pps_type == 'OS':
-        # Algorithm 1, Step 4: Construct normalized stabilized probabilities
-        # p_i = (|φ_i^(0)| + δ) / Σ_j(|φ_j^(0)| + δ)
-        abs_phi = np.abs(phi_pilot_full)
-        numerator = abs_phi + delta
-        pps_probs = numerator / np.sum(numerator)
-        
-    elif pps_type == 'LSS':
-        # LSS: Leverage score sampling
-        X_aug = np.c_[np.ones(N), X]
-        try:
-            Q, _ = np.linalg.qr(X_aug)
-            leverages = np.sum(Q**2, axis=1)
-            # Add small stabilization and normalize
-            leverages_stabilized = leverages + delta
-            pps_probs = leverages_stabilized / np.sum(leverages_stabilized)
-        except np.linalg.LinAlgError:
-            print("Warning: QR decomposition failed for LSS, falling back to uniform probabilities.")
-            pps_probs = np.full(N, 1.0 / N)
-    
-    else:
-        raise ValueError(f"Unknown pps_type: {pps_type}")
+    # Algorithm 1, Step 4: Construct normalized stabilized probabilities
+    # p_i = (|φ_i^(0)| + δ) / Σ_j(|φ_j^(0)| + δ)
+    abs_phi = np.abs(phi_pilot_full)
+    numerator = abs_phi + delta
+    pps_probs = numerator / np.sum(numerator)
 
     # =========================================================================
     # PHASE 2: MAIN SUBSAMPLING AND FINAL ESTIMATION (Algorithm 1, Steps 5-8)
@@ -415,11 +399,14 @@ def run_os(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
 
 def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     """
-    LSS: Leverage Score Subsampling for DML.
+    LSS: Leverage Score Subsampling for DML (Single-Stage).
     
-    Benchmark method that uses leverage scores instead of pseudo-outcomes
-    for computing sampling probabilities. Similar two-stage structure to OS-DML
-    but with different probability construction.
+    Benchmark method that uses leverage scores for sampling probabilities.
+    Unlike OS-DML, this is a single-stage method that directly samples
+    based on statistical leverage scores without pilot estimation.
+    
+    Leverage scores: h_i = diagonal elements of H = X(X'X)^{-1}X'
+    Sampling probabilities: p_i ∝ h_i
     
     Args:
         X: Covariates (N x p)
@@ -434,5 +421,52 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     Returns:
         Dict with keys: est_ate, ci_lower, ci_upper, runtime
     """
-    return _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, 'LSS', **kwargs)
+    start_time = time.time()
+    N = len(Y_obs)
+    r_total = r['r0'] + r['r1']  # Total sample size
+    misspecification = kwargs.get('misspecification')
+    delta = kwargs.get('delta', 0.01)  # Stabilization constant
+    
+    # =========================================================================
+    # SINGLE-STAGE LEVERAGE SCORE SAMPLING
+    # =========================================================================
+    
+    # Compute leverage scores from covariate matrix
+    X_aug = np.c_[np.ones(N), X]  # Add intercept
+    
+    try:
+        # Compute Q from QR decomposition (more stable than (X'X)^{-1})
+        Q, _ = np.linalg.qr(X_aug)
+        leverages = np.sum(Q**2, axis=1)  # h_i = ||Q_i||^2
+        
+        # Stabilize and normalize to get sampling probabilities
+        stabilized_leverages = leverages + delta
+        pps_probs = stabilized_leverages / np.sum(stabilized_leverages)
+        
+    except np.linalg.LinAlgError:
+        print("Warning: QR decomposition failed for LSS, falling back to uniform sampling")
+        pps_probs = np.full(N, 1.0 / N)
+    
+    # Draw single subsample based on leverage scores
+    subsample_idx = np.random.choice(N, size=r_total, replace=True, p=pps_probs)
+    q_j = pps_probs[subsample_idx]  # Selection probabilities for each draw
+    
+    # Extract subsampled data
+    X_sub, W_sub, Y_sub = X[subsample_idx], W[subsample_idx], Y_obs[subsample_idx]
+    
+    # Fit nuisance models with importance weights
+    weights = 1.0 / q_j
+    mu0, mu1, e = _fit_nuisance_models(X_sub, W_sub, Y_sub, k_folds, is_rct, 
+                                        np.mean(W_sub), sample_weight=weights, 
+                                        misspecification=misspecification)
+    
+    # Compute pseudo-outcomes
+    scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
+    
+    # Hansen-Hurwitz estimator and inference
+    est_ate, ci_lower, ci_upper = _get_hansen_hurwitz_ci(scores, q_j, N)
+    
+    runtime = time.time() - start_time
+    return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
+            "runtime": runtime}
 
