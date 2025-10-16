@@ -100,12 +100,14 @@ class OSHyperparameterOptimizer:
         if scenarios == 'all':
             self.scenarios = all_scenarios
             self.multi_scenario = True
+            self.scenario_name = 'all_scenarios'
             print(f"Initializing multi-scenario optimizer (all 4 scenarios)")
         else:
             if scenarios not in all_scenarios:
                 raise ValueError(f"Unknown scenario: {scenarios}")
             self.scenarios = {scenarios: all_scenarios[scenarios]}
             self.multi_scenario = False
+            self.scenario_name = scenarios
             print(f"Initializing single-scenario optimizer ({scenarios})")
         
         print(f"  N_replications: {n_replications} per scenario per trial")
@@ -121,7 +123,9 @@ class OSHyperparameterOptimizer:
         """
         # Suggest hyperparameters
         n_estimators = trial.suggest_int('n_estimators', 20, 150, step=10)
-        delta = trial.suggest_float('delta', 1e-4, 1e-1, log=True)  # 10^-4 to 10^-1
+        # Sample log10(delta) uniformly in [-4, -1], then convert: 10^-4, 10^-3.5, 10^-3, etc.
+        log10_delta = trial.suggest_float('log10_delta', -4, -1)
+        delta = 10 ** log10_delta
         pilot_ratio = trial.suggest_float('pilot_ratio', 0.1, 0.9, step=0.05)
         
         r0 = int(self.r_total * pilot_ratio)
@@ -307,24 +311,29 @@ class OSHyperparameterOptimizer:
             study: Optuna study object with results
         """
         print("\n" + "="*80)
-        print(f"HYPERPARAMETER OPTIMIZATION FOR OS-DML ({self.scenario})")
+        mode_str = "Multi-Scenario" if self.multi_scenario else self.scenario_name
+        print(f"HYPERPARAMETER OPTIMIZATION FOR OS-DML ({mode_str})")
         print("="*80)
         print(f"\nSearch space:")
         print(f"  n_estimators: [20, 150] (step 10)")
-        print(f"  delta:        [10^-4, 10^-1] = [0.0001, 0.1] (log scale)")
+        print(f"  delta:        [10^-4, 10^-1] = [0.0001, 0.1] (log10 scale)")
+        print(f"                Sampled as: 10^x where x ~ Uniform[-4, -1]")
         print(f"  pilot_ratio:  [0.1, 0.9] (step 0.05)")
         print(f"\nOptimization:")
         print(f"  Algorithm:     Bayesian (TPE)")
         print(f"  Trials:        {n_trials}")
-        print(f"  Replications:  {self.n_replications} per trial")
-        print(f"  Total runs:    ~{n_trials * self.n_replications}")
-        print(f"\nEstimated time: ~{n_trials * self.n_replications * 2 / 60:.0f} minutes")
+        n_scenarios = len(self.scenarios)
+        total_runs = n_trials * self.n_replications * n_scenarios
+        print(f"  Replications:  {self.n_replications} per trial per scenario")
+        print(f"  Scenarios:     {n_scenarios}")
+        print(f"  Total runs:    ~{total_runs}")
+        print(f"\nEstimated time: ~{total_runs * 2 / 60:.0f} minutes")
         
         # Create study
         study = optuna.create_study(
             direction='minimize',
             sampler=optuna.samplers.TPESampler(seed=42),
-            study_name=f'os_dml_{self.scenario}'
+            study_name=f'os_dml_{self.scenario_name}'
         )
         
         # Optimize
@@ -362,7 +371,10 @@ def analyze_optimization_results(study, scenarios, multi_scenario=False):
     print(f"  Objective Value (Agg. RMSE + penalty): {best_trial.value:.4f}")
     print(f"\n  Optimal Hyperparameters:")
     print(f"    n_estimators:  {best_trial.params['n_estimators']}")
-    print(f"    delta:         {best_trial.params['delta']:.6f}")
+    # delta was sampled via log10_delta
+    best_delta = 10 ** best_trial.params['log10_delta']
+    print(f"    log10(delta):  {best_trial.params['log10_delta']:.2f}")
+    print(f"    delta:         {best_delta:.6f}")
     print(f"    pilot_ratio:   {best_trial.params['pilot_ratio']:.2f}")
     print(f"    r0:            {best_trial.user_attrs['r0']}")
     print(f"    r1:            {best_trial.user_attrs['r1']}")
@@ -399,9 +411,11 @@ def analyze_optimization_results(study, scenarios, multi_scenario=False):
     print(f"\n✓ All trials saved to: optuna_trials_{suffix}.csv")
     
     # Extract best parameters
+    best_delta = 10 ** best_trial.params['log10_delta']
     best_params = {
         'n_estimators': best_trial.params['n_estimators'],
-        'delta': best_trial.params['delta'],
+        'log10_delta': best_trial.params['log10_delta'],
+        'delta': best_delta,
         'pilot_ratio': best_trial.params['pilot_ratio'],
         'r0': best_trial.user_attrs['r0'],
         'r1': best_trial.user_attrs['r1'],
@@ -454,9 +468,9 @@ def create_optuna_visualizations(study, scenario):
     
     # 4. Contour plots for parameter pairs
     try:
-        fig = plot_contour(study, params=['n_estimators', 'delta'])
+        fig = plot_contour(study, params=['n_estimators', 'log10_delta'])
         fig.write_image(f'optuna_contour_gbm_delta_{scenario}.pdf')
-        print(f"✓ Contour (n_estimators vs delta): optuna_contour_gbm_delta_{scenario}.pdf")
+        print(f"✓ Contour (n_estimators vs log10_delta): optuna_contour_gbm_delta_{scenario}.pdf")
     except Exception as e:
         print(f"  Could not create GBM-delta contour: {e}")
     
@@ -468,9 +482,9 @@ def create_optuna_visualizations(study, scenario):
         print(f"  Could not create GBM-pilot contour: {e}")
     
     try:
-        fig = plot_contour(study, params=['delta', 'pilot_ratio'])
+        fig = plot_contour(study, params=['log10_delta', 'pilot_ratio'])
         fig.write_image(f'optuna_contour_delta_pilot_{scenario}.pdf')
-        print(f"✓ Contour (delta vs pilot_ratio): optuna_contour_delta_pilot_{scenario}.pdf")
+        print(f"✓ Contour (log10_delta vs pilot_ratio): optuna_contour_delta_pilot_{scenario}.pdf")
     except Exception as e:
         print(f"  Could not create delta-pilot contour: {e}")
 
@@ -485,6 +499,8 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     
     # Extract parameters and metrics
     trials_df['rmse_only'] = trials_df['value'] - abs(trials_df['user_attrs_coverage'] - 0.95) * 0.5
+    # Convert log10_delta to delta for plotting
+    trials_df['params_delta'] = 10 ** trials_df['params_log10_delta']
     
     fig, axes = plt.subplots(3, 3, figsize=(16, 14))
     
@@ -500,14 +516,14 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
-    # delta vs RMSE
+    # delta vs RMSE (on log10 scale)
     axes[0, 1].scatter(trials_df['params_delta'], trials_df['rmse_only'], 
                       alpha=0.5, s=30, c=trials_df['user_attrs_coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
     axes[0, 1].axvline(x=best_params['delta'], color='red', linestyle='--', label='Optimal')
     axes[0, 1].axvline(x=0.01, color='orange', linestyle=':', label='Current')
     axes[0, 1].set_xlabel('Delta (Stabilization Constant)')
     axes[0, 1].set_ylabel('RMSE')
-    axes[0, 1].set_title('Delta vs RMSE')
+    axes[0, 1].set_title('Delta vs RMSE (log10 scale)')
     axes[0, 1].set_xscale('log')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
@@ -805,7 +821,8 @@ if __name__ == "__main__":
     print("for OS-DML across ALL scenarios (OBS-S, OBS-C, RCT-S, RCT-C).")
     print("\nHyperparameters being tuned:")
     print("  1. n_estimators: GBM complexity in pilot [20, 150]")
-    print("  2. delta: Stabilization constant [10^-4, 10^-1] (log scale)")
+    print("  2. delta: Stabilization constant [10^-4, 10^-1] (log10 scale)")
+    print("     → Sampled as: log10(delta) ~ Uniform[-4, -1], then delta = 10^x")
     print("  3. pilot_ratio: r0/(r0+r1) [0.1, 0.9]")
     
     # Configuration

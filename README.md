@@ -223,7 +223,7 @@ MIT License - see LICENSE file for details.
 ## Contact
 
 - **Issues:** [GitHub Issues](https://github.com/your-username/OS-DML/issues)
-- **Email:** your.email@domain.com
+- **Email:** zhanght@gdou.edu.cn
 
 ---
 
