@@ -22,8 +22,9 @@ Phase 1: Pilot Estimation and Probability Construction (Steps 1-4)
     1. Draw uniform pilot subsample S_0 of size r_0
     2. Fit cross-fitted nuisance models η^(0) = (μ₀, μ₁, e) on pilot data
     3. Predict pseudo-outcomes φ_i^(0) for ALL N observations in full dataset
-    4. Construct normalized stabilized sampling probabilities:
-       p_i = (|φ_i^(0)| + δ) / Σ_j(|φ_j^(0)| + δ)
+    4. Compute centered pseudo-outcomes and construct stabilized sampling probabilities:
+       φ̂̄^(0) = N^(-1) * Σ_i φ̂_i^(0) (average over full data)
+       p_i ∝ |φ̂_i^(0) - φ̂̄^(0)| + δ (centered and stabilized)
 
 Phase 2: Main Subsampling and Final Estimation (Steps 5-8)
     5. Draw main subsample S_1 of size r_1 using probabilities {p_i}
@@ -36,7 +37,8 @@ Phase 2: Main Subsampling and Final Estimation (Steps 5-8)
 
 Inference (Steps 9-10)
     9-10. Compute variance:
-       Hájek: Jackknife variance Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
+       Hájek: Plug-in variance Var(τ̂_HJ) = (1/(r*N²)) * (1/(r-1)) * Σ_t(U_t - Ū)²
+             where U_t = (φ̂_t - τ̂_HJ) / q_t and Ū = r^(-1) * Σ_t U_t
        Hansen-Hurwitz: Design-based variance Var(τ_HH) = (1/(N²*r)) * (1/(r-1)) * Σ_t(H_t - H̄)²
 
 THEORETICAL PROPERTIES:
@@ -151,11 +153,12 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
 
 def _get_hajek_ci(scores, q_j, N):
     """
-    Calculates Hájek ATE estimator with jackknife variance estimation.
+    Calculates Hájek ATE estimator with plug-in variance estimation.
     
-    Implements the Hájek estimator from the provided formula:
+    Implements the updated Hájek estimator from Algorithm 1:
     - Point estimation: τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
-    - Jackknife variance: Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
+    - Plug-in variance: Var(τ̂_HJ) = (1/(r*N²)) * (1/(r-1)) * Σ_t(U_t - Ū)²
+      where U_t = (φ̂_t - τ̂_HJ) / q_t and Ū = r^(-1) * Σ_t U_t
     
     Args:
         scores: Pseudo-outcomes φ̂_{I_t}
@@ -175,26 +178,15 @@ def _get_hajek_ci(scores, q_j, N):
     denominator = np.sum(1 / q_j)
     est_ate = numerator / denominator
     
-    # Step 9-10: Jackknife variance estimation
-    # For each t = 1, ..., r, form the leave-one-out Hájek replicate
-    loo_estimates = []
-    for t in range(r):
-        # τ̂_HJ^(-t) = (Σ_{s≠t} φ̂_{I_s} / q_{I_s}) / (Σ_{s≠t} 1 / q_{I_s})
-        mask = np.arange(r) != t
-        loo_num = np.sum((scores / q_j)[mask])
-        loo_den = np.sum((1 / q_j)[mask])
-        if loo_den > 0:
-            loo_estimates.append(loo_num / loo_den)
-        else:
-            loo_estimates.append(est_ate)  # fallback
+    # Step 9-10: Plug-in variance estimation
+    # U_t = (φ̂_t - τ̂_HJ) / q_t
+    U_t = (scores - est_ate) / q_j
     
-    loo_estimates = np.array(loo_estimates)
+    # Ū = r^(-1) * Σ_t U_t
+    U_bar = np.mean(U_t)
     
-    # τ̄ = (r_0 + r_1)^(-1) * Σ_t τ̂_HJ^(-t)
-    tau_bar = np.mean(loo_estimates)
-    
-    # Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
-    var_hat = ((r - 1) / r) * np.sum((loo_estimates - tau_bar)**2)
+    # Var(τ̂_HJ) = (1/(r*N²)) * (1/(r-1)) * Σ_t(U_t - Ū)²
+    var_hat = (1.0 / (r * N**2)) * (1.0 / (r - 1)) * np.sum((U_t - U_bar)**2)
     se = np.sqrt(var_hat) if var_hat >= 0 else np.nan
     
     ci_lower = est_ate - 1.96 * se
@@ -323,7 +315,13 @@ def run_unif(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     """
     start_time = time.time()
     N = len(Y_obs)
-    r_total = r['r0'] + r['r1']
+    
+    # Handle both old format (r0, r1) and new format (r_total)
+    if 'r_total' in r:
+        r_total = r['r_total']
+    else:
+        r_total = r['r0'] + r['r1']
+    
     misspecification = kwargs.get('misspecification')
 
     # Draw uniform subsample with replacement
@@ -355,19 +353,27 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
         X, W, Y_obs: Full population data
         pi_true: True propensity scores (not used in OS-DML)
         is_rct: Whether the data comes from RCT
-        r: Dictionary with 'r0' (pilot size) and 'r1' (main subsample size)
+        r: Dictionary with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
         k_folds: Number of folds for cross-fitting
         pps_type: Should be 'OS' (kept for backward compatibility)
-        **kwargs: Additional arguments including 'delta' and 'misspecification'
+        **kwargs: Additional arguments including 'misspecification'
     
     Returns:
         Dictionary with est_ate, ci_lower, ci_upper, runtime
     """
     start_time = time.time()
     N = len(Y_obs)
-    r0, r1 = r['r0'], r['r1']
+    
+    # Handle both old format (r0, r1) and new format (r_total)
+    if 'r_total' in r:
+        r_total = r['r_total']
+        r0 = int(r_total * config.PILOT_RATIO)
+        r1 = r_total - r0
+    else:
+        r0, r1 = r['r0'], r['r1']
+    
     misspecification = kwargs.get('misspecification')
-    delta = kwargs.get('delta', 0.01)  # Stabilization constant from Algorithm 1
+    delta = config.DELTA  # Use global delta parameter
 
     # =========================================================================
     # PHASE 1: PILOT ESTIMATION AND PROBABILITY CONSTRUCTION (Algorithm 1, Steps 1-4)
@@ -378,8 +384,8 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     X_pilot, W_pilot, Y_pilot = X[pilot_idx], W[pilot_idx], Y_obs[pilot_idx]
     
     # Step 2: Fit cross-fitted nuisance models η^(0) on pilot data
-    lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 30, 
-                         'verbose': -1}
+    lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 
+                         'n_estimators': config.PILOT_N_ESTIMATORS, 'verbose': -1}
     
     mu0_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
         X_pilot[W_pilot == 0], Y_pilot[W_pilot == 0])
@@ -400,10 +406,15 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     # φ_i^(0) = φ(Z_i; η^(0)) for all i
     phi_pilot_full = _orthogonal_score(Y_obs, W, mu0_full, mu1_full, e_full)
 
-    # Algorithm 1, Step 4: Construct normalized stabilized probabilities
-    # p_i = (|φ_i^(0)| + δ) / Σ_j(|φ_j^(0)| + δ)
-    abs_phi = np.abs(phi_pilot_full)
-    numerator = abs_phi + delta
+    # Algorithm 1, Step 4: Compute centered pseudo-outcomes and construct probabilities
+    # φ̂̄^(0) = N^(-1) * Σ_i φ̂_i^(0) (average over full data)
+    phi_bar_pilot = np.mean(phi_pilot_full)
+    
+    # Step 4: Set stabilized centered PPS probabilities
+    # p_i ∝ |φ̂_i^(0) - φ̂̄^(0)| + δ
+    centered_phi = phi_pilot_full - phi_bar_pilot
+    abs_centered_phi = np.abs(centered_phi)
+    numerator = abs_centered_phi + delta
     pps_probs = numerator / np.sum(numerator)
 
     # =========================================================================
@@ -456,7 +467,7 @@ def run_os(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     1. Pilot stage: Estimate nuisance functions on uniform subsample
     2. Main stage: Draw probability-proportional-to-size sample based on |φ_i^(0)|
     
-    Uses Hansen-Hurwitz estimator with design-based inference.
+    Uses Hájek estimator with plug-in variance estimation by default.
     
     Args:
         X: Covariates (N x p)
@@ -464,10 +475,9 @@ def run_os(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
         Y_obs: Observed outcomes (N,)
         pi_true: True propensity scores (not used in OS-DML)
         is_rct: Whether data comes from RCT
-        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size)
+        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
         k_folds: Number of cross-fitting folds
-        **kwargs: Additional args including 'delta' (stabilization constant, default=0.01)
-                  and 'misspecification' (for robustness experiments)
+        **kwargs: Additional args including 'misspecification' (for robustness experiments)
     
     Returns:
         Dict with keys: est_ate, ci_lower, ci_upper, runtime
@@ -491,18 +501,24 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
         Y_obs: Observed outcomes (N,)
         pi_true: True propensity scores (not used)
         is_rct: Whether data comes from RCT
-        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size)
+        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
         k_folds: Number of cross-fitting folds
-        **kwargs: Additional args including 'delta' (stabilization constant)
+        **kwargs: Additional args including 'misspecification'
     
     Returns:
         Dict with keys: est_ate, ci_lower, ci_upper, runtime
     """
     start_time = time.time()
     N = len(Y_obs)
-    r_total = r['r0'] + r['r1']  # Total sample size
+    
+    # Handle both old format (r0, r1) and new format (r_total)
+    if 'r_total' in r:
+        r_total = r['r_total']
+    else:
+        r_total = r['r0'] + r['r1']
+    
     misspecification = kwargs.get('misspecification')
-    delta = kwargs.get('delta', 0.01)  # Stabilization constant
+    delta = config.DELTA  # Use global delta parameter
     
     # =========================================================================
     # SINGLE-STAGE LEVERAGE SCORE SAMPLING

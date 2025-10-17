@@ -18,7 +18,7 @@ import methods
 # =============================================================================
 BASE_SEED = 20250919
 N_SIM = 50  # Monte Carlo replications (use 1000 for a full study)
-N_POPULATION = 100000 # Population size N
+N_POPULATION = 1000000 # Population size N
 K_FOLDS = 2 # Number of folds for cross-fitting
 
 # =============================================================================
@@ -27,6 +27,14 @@ K_FOLDS = 2 # Number of folds for cross-fitting
 # Choose estimator for point estimation and variance estimation
 # Options: 'hajek' (default), 'hh' (Hansen-Hurwitz)
 ESTIMATOR_TYPE = 'hajek'  # Default to Hájek estimator
+
+# =============================================================================
+# 1.2 OS-DML ALGORITHM PARAMETERS
+# =============================================================================
+# Global parameters for OS-DML algorithm
+PILOT_RATIO = 0.3          # Pilot sample ratio: r0 / (r0 + r1)
+DELTA = 0.01               # Stabilization constant for probability construction
+PILOT_N_ESTIMATORS = 30    # Number of estimators for pilot stage LightGBM models
 
 # =============================================================================
 # 2. EXPERIMENT DEFINITIONS
@@ -69,14 +77,19 @@ def get_experiments():
     
     # --- Experiment Construction ---
     experiments = {
-        "experiment_1_pilot_allocation": {
-            "description": "Investigates the effect of pilot sample allocation on OS-DML performance.",
-            "scenarios": ['RCT-S', 'OBS-S'],
+        "experiment_1_sensitivity_analysis": {
+            "description": "Hyperparameter sensitivity analysis using Bayesian optimization to find optimal parameters.",
+            "scenarios": ['RCT-S', 'RCT-C', 'OBS-S', 'OBS-C'],
             "methods": ['OS'],
-            "base_dir": "./simulation_results/exp1_pilot_allocation",
+            "base_dir": "./simulation_results/exp1_sensitivity_analysis",
             "params": {
                 "r_total": 10000,
-                "pilot_ratios": np.arange(0.1, 1.0, 0.1) # Pilot ratios from 0.1 to 0.9
+                "n_trials": 60,
+                "n_replications": 10,
+                "aggregation": "mean",
+                "n_jobs": -1,
+                "checkpoint": True,
+                "resume": True
             }
         },
         "experiment_2_main_comparison": {
@@ -85,7 +98,8 @@ def get_experiments():
             "methods": ['OS', 'UNIF', 'LSS', 'FULL'],
             "base_dir": "./simulation_results/exp2_main_comparison",
             "params": {
-                "r0": 3000, "r1": 7000, "k_folds": K_FOLDS
+                "r_total": 10000,  # Use r_total instead of fixed r0, r1
+                "k_folds": K_FOLDS
             }
         },
         "experiment_3_robustness_check": {
@@ -94,7 +108,8 @@ def get_experiments():
             "methods": ['OS'],
             "base_dir": "./simulation_results/exp3_robustness_check",
             "params": {
-                "r0": 3000, "r1": 7000, "k_folds": K_FOLDS,
+                "r_total": 10000,  # Use r_total instead of fixed r0, r1
+                "k_folds": K_FOLDS,
                 "misspecification_scenarios": ['correct_correct', 'correct_wrong', 'wrong_correct', 'wrong_wrong']
             }
         }
