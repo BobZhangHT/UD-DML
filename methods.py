@@ -29,14 +29,15 @@ Phase 2: Main Subsampling and Final Estimation (Steps 5-8)
     5. Draw main subsample S_1 of size r_1 using probabilities {p_i}
     6. Form combined subsample S_comb = S_0 ∪ S_1 with importance weights
     7. Fit final cross-fitted nuisance models on combined subsample
-    8. Compute Hansen-Hurwitz estimator:
-       τ_HH = (1/(N*r)) * Σ_t (φ_{I_t} / q_{I_t})
+    8. Compute estimator (Hájek or Hansen-Hurwitz):
+       Hájek: τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
+       Hansen-Hurwitz: τ_HH = (1/(N*r)) * Σ_t (φ_{I_t} / q_{I_t})
        where q_{I_t} = 1/N for pilot draws, q_{I_t} = p_{I_t} for PPS draws
 
 Inference (Steps 9-10)
-    9. Define scaled pseudo-outcomes H_t = φ_{I_t} / q_{I_t}
-   10. Compute design-based variance:
-       Var(τ_HH) = (1/(N²*r)) * (1/(r-1)) * Σ_t(H_t - H̄)²
+    9-10. Compute variance:
+       Hájek: Jackknife variance Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
+       Hansen-Hurwitz: Design-based variance Var(τ_HH) = (1/(N²*r)) * (1/(r-1)) * Σ_t(H_t - H̄)²
 
 THEORETICAL PROPERTIES:
 - Design-unbiased for estimated finite-population mean
@@ -148,6 +149,60 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
     e_preds = np.clip(e_preds, 0.01, 0.99)
     return mu0_preds, mu1_preds, e_preds
 
+def _get_hajek_ci(scores, q_j, N):
+    """
+    Calculates Hájek ATE estimator with jackknife variance estimation.
+    
+    Implements the Hájek estimator from the provided formula:
+    - Point estimation: τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
+    - Jackknife variance: Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
+    
+    Args:
+        scores: Pseudo-outcomes φ̂_{I_t}
+        q_j: Selection probabilities for each draw
+        N: Population size
+    
+    Returns:
+        Tuple of (est_ate, ci_lower, ci_upper)
+    """
+    r = len(scores)
+    if r <= 1:
+        return np.nan, np.nan, np.nan
+    
+    # Step 8: Hájek ATE estimator
+    # τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
+    numerator = np.sum(scores / q_j)
+    denominator = np.sum(1 / q_j)
+    est_ate = numerator / denominator
+    
+    # Step 9-10: Jackknife variance estimation
+    # For each t = 1, ..., r, form the leave-one-out Hájek replicate
+    loo_estimates = []
+    for t in range(r):
+        # τ̂_HJ^(-t) = (Σ_{s≠t} φ̂_{I_s} / q_{I_s}) / (Σ_{s≠t} 1 / q_{I_s})
+        mask = np.arange(r) != t
+        loo_num = np.sum((scores / q_j)[mask])
+        loo_den = np.sum((1 / q_j)[mask])
+        if loo_den > 0:
+            loo_estimates.append(loo_num / loo_den)
+        else:
+            loo_estimates.append(est_ate)  # fallback
+    
+    loo_estimates = np.array(loo_estimates)
+    
+    # τ̄ = (r_0 + r_1)^(-1) * Σ_t τ̂_HJ^(-t)
+    tau_bar = np.mean(loo_estimates)
+    
+    # Var_JK(τ̂_HJ) = (r-1)/r * Σ_t(τ̂_HJ^(-t) - τ̄)²
+    var_hat = ((r - 1) / r) * np.sum((loo_estimates - tau_bar)**2)
+    se = np.sqrt(var_hat) if var_hat >= 0 else np.nan
+    
+    ci_lower = est_ate - 1.96 * se
+    ci_upper = est_ate + 1.96 * se
+    
+    return est_ate, ci_lower, ci_upper
+
+
 def _get_hansen_hurwitz_ci(scores, q_j, N):
     """
     Calculates design-based CI for the Hansen-Hurwitz estimator following Algorithm 1.
@@ -183,7 +238,29 @@ def _get_hansen_hurwitz_ci(scores, q_j, N):
     ci_upper = est_ate + 1.96 * se
     
     return est_ate, ci_lower, ci_upper
+
+
+def _get_estimator_ci(scores, q_j, N, estimator_type='hajek'):
+    """
+    Wrapper function to choose between Hájek and Hansen-Hurwitz estimators.
     
+    Args:
+        scores: Pseudo-outcomes φ_{I_t}
+        q_j: Selection probabilities for each draw
+        N: Population size
+        estimator_type: 'hajek' or 'hh'
+    
+    Returns:
+        Tuple of (est_ate, ci_lower, ci_upper)
+    """
+    if estimator_type.lower() == 'hajek':
+        return _get_hajek_ci(scores, q_j, N)
+    elif estimator_type.lower() == 'hh':
+        return _get_hansen_hurwitz_ci(scores, q_j, N)
+    else:
+        raise ValueError(f"Unknown estimator type: {estimator_type}. Use 'hajek' or 'hh'.")
+
+
 def _get_full_data_ci(scores):
     """
     Calculates standard DML confidence interval using influence function variance.
@@ -262,8 +339,8 @@ def run_unif(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
                                         misspecification=misspecification)
     scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
     
-    # Hansen-Hurwitz estimator and inference
-    est_ate, ci_lower, ci_upper = _get_hansen_hurwitz_ci(scores, q_j, N)
+    # Estimator and inference (Hájek or Hansen-Hurwitz)
+    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
     return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
             "runtime": time.time() - start_time}
 
@@ -363,8 +440,8 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     # INFERENCE (Algorithm 1, Steps 8-10)
     # =========================================================================
     
-    # Steps 8-10: Calculate Hansen-Hurwitz estimator and design-based variance
-    est_ate, ci_lower, ci_upper = _get_hansen_hurwitz_ci(scores, q_j, N)
+    # Steps 8-10: Calculate estimator and variance (Hájek or Hansen-Hurwitz)
+    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
     
     runtime = time.time() - start_time
     return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
@@ -463,8 +540,8 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     # Compute pseudo-outcomes
     scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
     
-    # Hansen-Hurwitz estimator and inference
-    est_ate, ci_lower, ci_upper = _get_hansen_hurwitz_ci(scores, q_j, N)
+    # Estimator and inference (Hájek or Hansen-Hurwitz)
+    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
     
     runtime = time.time() - start_time
     return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 

@@ -9,7 +9,22 @@ Tunes three key parameters:
   2. delta: Stabilization constant
   3. r0: Pilot sample size (r1 = r_total - r0)
 
-Uses efficient Bayesian optimization instead of exhaustive grid search.
+Features:
+  - Efficient Bayesian optimization (TPE algorithm)
+  - Checkpoint mechanism: Auto-saves progress to SQLite database
+  - Multi-CPU support: Parallel trial execution
+  - Resume capability: Can interrupt (Ctrl+C) and resume later
+  - Server-friendly: Uses matplotlib (no browser needed) for visualizations
+
+Usage:
+  python hyperparameter_tuning.py
+  
+  To resume after interruption:
+  - Simply run the script again with RESUME=True (default)
+  - Progress is automatically loaded from checkpoint database
+  
+  To start fresh:
+  - Set RESUME=False or delete the .db file
 """
 import warnings
 warnings.filterwarnings('ignore')
@@ -58,7 +73,7 @@ class OSHyperparameterOptimizer:
     """
     
     def __init__(self, scenarios='all', n_replications=10, r_total=10000, 
-                 aggregation='mean'):
+                 aggregation='mean', n_jobs=1):
         """
         Initialize the optimizer.
         
@@ -67,11 +82,13 @@ class OSHyperparameterOptimizer:
             n_replications: Number of Monte Carlo replications per trial per scenario
             r_total: Total sample budget (r0 + r1)
             aggregation: How to aggregate across scenarios ('mean', 'max', 'weighted')
+            n_jobs: Number of parallel jobs (-1 for all CPUs, 1 for sequential)
         """
         self.n_replications = n_replications
         self.r_total = r_total
         self.N = 100000  # Population size
         self.aggregation = aggregation
+        self.n_jobs = n_jobs
         
         # Configure scenarios
         all_scenarios = {
@@ -140,8 +157,10 @@ class OSHyperparameterOptimizer:
             
             for rep in range(self.n_replications):
                 try:
-                    # Generate data with different seed
-                    np.random.seed(config.BASE_SEED + rep)
+                    # Generate data with different seed (thread-safe)
+                    # Use trial number and rep to ensure unique seeds across parallel workers
+                    seed = config.BASE_SEED + trial.number * 10000 + rep
+                    np.random.seed(seed)
                     data = scenario_config['func'](**scenario_config['params'])
                     true_ate = data['true_ate']
                     
@@ -300,12 +319,14 @@ class OSHyperparameterOptimizer:
             'runtime': runtime
         }
     
-    def optimize(self, n_trials=100):
+    def optimize(self, n_trials=100, storage_name=None, resume=True):
         """
         Run Bayesian optimization to find optimal hyperparameters.
         
         Args:
             n_trials: Number of trials for Optuna
+            storage_name: Database file name for checkpointing (None for in-memory)
+            resume: Whether to resume from existing study if available
         
         Returns:
             study: Optuna study object with results
@@ -327,14 +348,51 @@ class OSHyperparameterOptimizer:
         print(f"  Replications:  {self.n_replications} per trial per scenario")
         print(f"  Scenarios:     {n_scenarios}")
         print(f"  Total runs:    ~{total_runs}")
-        print(f"\nEstimated time: ~{total_runs * 2 / 60:.0f} minutes")
         
-        # Create study
+        # Checkpoint configuration
+        if storage_name is None:
+            storage_name = f'optuna_{self.scenario_name}.db'
+        storage_url = f'sqlite:///{storage_name}'
+        
+        print(f"\nCheckpoint:")
+        print(f"  Storage:       {storage_name}")
+        print(f"  Resume:        {resume}")
+        
+        # Parallel execution configuration
+        n_jobs = self.n_jobs
+        if n_jobs == -1:
+            import multiprocessing
+            n_jobs = multiprocessing.cpu_count()
+        
+        print(f"\nParallel Execution:")
+        print(f"  CPUs:          {n_jobs if n_jobs > 1 else '1 (sequential)'}")
+        
+        if n_jobs > 1:
+            total_time_estimate = total_runs * 2 / 60 / n_jobs
+        else:
+            total_time_estimate = total_runs * 2 / 60
+        print(f"\nEstimated time: ~{total_time_estimate:.0f} minutes")
+        
+        # Create or load study with checkpoint support
         study = optuna.create_study(
             direction='minimize',
             sampler=optuna.samplers.TPESampler(seed=42),
-            study_name=f'os_dml_{self.scenario_name}'
+            study_name=f'os_dml_{self.scenario_name}',
+            storage=storage_url,
+            load_if_exists=resume
         )
+        
+        # Check if resuming
+        if len(study.trials) > 0 and resume:
+            print(f"\n✓ Resuming from existing study with {len(study.trials)} completed trials")
+            remaining_trials = max(0, n_trials - len(study.trials))
+            if remaining_trials == 0:
+                print(f"  Study already has {len(study.trials)} trials (requested {n_trials})")
+                print(f"  To run more trials, increase n_trials parameter")
+                return study
+            else:
+                print(f"  Running {remaining_trials} additional trials...")
+                n_trials = remaining_trials
         
         # Optimize
         print("\nStarting optimization...")
@@ -344,8 +402,12 @@ class OSHyperparameterOptimizer:
             self.objective, 
             n_trials=n_trials,
             show_progress_bar=True,
-            n_jobs=1  # Run sequentially for stability
+            n_jobs=n_jobs,
+            catch=(Exception,)  # Continue on errors in parallel mode
         )
+        
+        print(f"\n✓ Study saved to {storage_name}")
+        print(f"  Total trials completed: {len(study.trials)}")
         
         return study
 
@@ -434,12 +496,187 @@ def analyze_optimization_results(study, scenarios, multi_scenario=False):
     return trials_df, best_params
 
 
+def create_matplotlib_visualizations(study, scenario):
+    """
+    Create comprehensive visualizations using matplotlib (server-friendly, no browser needed).
+    """
+    print("\n" + "="*80)
+    print("CREATING MATPLOTLIB VISUALIZATIONS (Server-friendly)")
+    print("="*80)
+    
+    trials_df = study.trials_dataframe()
+    completed_trials = trials_df[trials_df['state'] == 'COMPLETE'].copy()
+    
+    if len(completed_trials) == 0:
+        print("  No completed trials to visualize")
+        return
+    
+    # 1. Optimization History
+    try:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        ax.plot(completed_trials['number'], completed_trials['value'], 'o-', alpha=0.6, label='Objective Value')
+        # Plot best value so far
+        best_values = completed_trials['value'].cummin()
+        ax.plot(completed_trials['number'], best_values, 'r-', linewidth=2, label='Best Value')
+        ax.set_xlabel('Trial Number', fontsize=12)
+        ax.set_ylabel('Objective Value (RMSE + penalty)', fontsize=12)
+        ax.set_title('Optimization History', fontsize=14, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f'optuna_history_{scenario}.pdf', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Optimization history: optuna_history_{scenario}.pdf")
+    except Exception as e:
+        print(f"  Could not create optimization history: {e}")
+    
+    # 2. Parameter Importances (using random forest importance from optuna)
+    try:
+        from optuna.importance import get_param_importances
+        importances = get_param_importances(study)
+        
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        params = list(importances.keys())
+        values = list(importances.values())
+        colors = plt.cm.viridis(np.linspace(0.3, 0.9, len(params)))
+        
+        bars = ax.barh(params, values, color=colors)
+        ax.set_xlabel('Importance', fontsize=12)
+        ax.set_ylabel('Parameters', fontsize=12)
+        ax.set_title('Hyperparameter Importance', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='x')
+        
+        # Add value labels
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(width, bar.get_y() + bar.get_height()/2, f'{width:.3f}',
+                   ha='left', va='center', fontsize=10, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(f'optuna_importance_{scenario}.pdf', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Parameter importances: optuna_importance_{scenario}.pdf")
+    except Exception as e:
+        print(f"  Could not create parameter importance plot: {e}")
+    
+    # 3. Parallel Coordinate Plot
+    try:
+        fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+        
+        # Normalize parameters to [0, 1]
+        param_cols = ['params_n_estimators', 'params_log10_delta', 'params_pilot_ratio']
+        normalized = completed_trials[param_cols].copy()
+        for col in param_cols:
+            min_val = normalized[col].min()
+            max_val = normalized[col].max()
+            if max_val > min_val:
+                normalized[col] = (normalized[col] - min_val) / (max_val - min_val)
+        
+        # Color by objective value
+        colors = completed_trials['value']
+        norm = plt.Normalize(vmin=colors.min(), vmax=colors.max())
+        cmap = plt.cm.RdYlGn_r
+        
+        # Plot each trial
+        for idx, row in normalized.iterrows():
+            trial_idx = completed_trials.index.get_loc(idx)
+            color = cmap(norm(colors.iloc[trial_idx]))
+            ax.plot(range(len(param_cols)), row[param_cols], 'o-', alpha=0.3, color=color, linewidth=1)
+        
+        ax.set_xticks(range(len(param_cols)))
+        ax.set_xticklabels(['n_estimators', 'log10_delta', 'pilot_ratio'], fontsize=11)
+        ax.set_ylabel('Normalized Value', fontsize=12)
+        ax.set_title('Parallel Coordinate Plot', fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Add colorbar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax)
+        cbar.set_label('Objective Value', fontsize=11)
+        
+        plt.tight_layout()
+        plt.savefig(f'optuna_parallel_{scenario}.pdf', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Parallel coordinate plot: optuna_parallel_{scenario}.pdf")
+    except Exception as e:
+        print(f"  Could not create parallel coordinate plot: {e}")
+    
+    # 4. Contour plots for parameter pairs
+    _create_contour_plot(completed_trials, 'params_n_estimators', 'params_log10_delta', 
+                        'n_estimators', 'log10_delta', scenario, 'gbm_delta')
+    _create_contour_plot(completed_trials, 'params_n_estimators', 'params_pilot_ratio',
+                        'n_estimators', 'pilot_ratio', scenario, 'gbm_pilot')
+    _create_contour_plot(completed_trials, 'params_log10_delta', 'params_pilot_ratio',
+                        'log10_delta', 'pilot_ratio', scenario, 'delta_pilot')
+
+
+def _create_contour_plot(trials_df, x_col, y_col, x_label, y_label, scenario, suffix):
+    """Helper function to create 2D contour plots"""
+    try:
+        from scipy.interpolate import griddata
+        
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        
+        x = trials_df[x_col].values
+        y = trials_df[y_col].values
+        z = trials_df['value'].values
+        
+        # Create grid
+        xi = np.linspace(x.min(), x.max(), 50)
+        yi = np.linspace(y.min(), y.max(), 50)
+        Xi, Yi = np.meshgrid(xi, yi)
+        
+        # Interpolate
+        Zi = griddata((x, y), z, (Xi, Yi), method='cubic', fill_value=z.mean())
+        
+        # Contour plot
+        contour = ax.contourf(Xi, Yi, Zi, levels=20, cmap='RdYlGn_r', alpha=0.8)
+        ax.contour(Xi, Yi, Zi, levels=10, colors='black', alpha=0.3, linewidths=0.5)
+        
+        # Scatter actual trials
+        scatter = ax.scatter(x, y, c=z, s=50, cmap='RdYlGn_r', edgecolors='black', 
+                           linewidth=1, alpha=0.9, zorder=5)
+        
+        # Mark best trial
+        best_idx = z.argmin()
+        ax.scatter(x[best_idx], y[best_idx], s=300, c='red', marker='*', 
+                  edgecolors='white', linewidth=2, label='Best Trial', zorder=10)
+        
+        ax.set_xlabel(x_label, fontsize=12)
+        ax.set_ylabel(y_label, fontsize=12)
+        ax.set_title(f'2D Contour: {x_label} vs {y_label}', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        
+        # Colorbar
+        cbar = plt.colorbar(contour, ax=ax)
+        cbar.set_label('Objective Value', fontsize=11)
+        
+        plt.tight_layout()
+        plt.savefig(f'optuna_contour_{suffix}_{scenario}.pdf', dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Contour ({x_label} vs {y_label}): optuna_contour_{suffix}_{scenario}.pdf")
+    except Exception as e:
+        print(f"  Could not create {suffix} contour: {e}")
+
+
 def create_optuna_visualizations(study, scenario):
     """
     Create comprehensive visualizations of optimization results.
+    Uses matplotlib by default (server-friendly), falls back to Plotly if needed.
     """
+    # Try matplotlib version first (no browser needed)
+    try:
+        create_matplotlib_visualizations(study, scenario)
+        return
+    except Exception as e:
+        print(f"\nMatplotlib visualizations failed: {e}")
+        print("Falling back to Plotly (may require browser/kaleido)...\n")
+    
+    # Fallback to Plotly (original implementation)
     print("\n" + "="*80)
-    print("CREATING OPTUNA VISUALIZATIONS")
+    print("CREATING OPTUNA VISUALIZATIONS (Plotly)")
     print("="*80)
     
     # 1. Optimization History
@@ -498,7 +735,10 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     print("="*80)
     
     # Extract parameters and metrics
-    trials_df['rmse_only'] = trials_df['value'] - abs(trials_df['user_attrs_coverage'] - 0.95) * 0.5
+    # Handle both single-scenario and multi-scenario modes
+    coverage_col = 'user_attrs_agg_coverage' if 'user_attrs_agg_coverage' in trials_df.columns else 'user_attrs_coverage'
+    trials_df['rmse_only'] = trials_df['value'] - abs(trials_df[coverage_col] - 0.95) * 0.5
+    trials_df['coverage'] = trials_df[coverage_col]
     # Convert log10_delta to delta for plotting
     trials_df['params_delta'] = 10 ** trials_df['params_log10_delta']
     
@@ -507,7 +747,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     # Row 1: Each parameter vs RMSE
     # n_estimators vs RMSE
     axes[0, 0].scatter(trials_df['params_n_estimators'], trials_df['rmse_only'], 
-                      alpha=0.5, s=30, c=trials_df['user_attrs_coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
+                      alpha=0.5, s=30, c=trials_df['coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
     axes[0, 0].axvline(x=best_params['n_estimators'], color='red', linestyle='--', label='Optimal')
     axes[0, 0].axvline(x=30, color='orange', linestyle=':', label='Current')
     axes[0, 0].set_xlabel('n_estimators (Pilot GBM Complexity)')
@@ -518,7 +758,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     
     # delta vs RMSE (on log10 scale)
     axes[0, 1].scatter(trials_df['params_delta'], trials_df['rmse_only'], 
-                      alpha=0.5, s=30, c=trials_df['user_attrs_coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
+                      alpha=0.5, s=30, c=trials_df['coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
     axes[0, 1].axvline(x=best_params['delta'], color='red', linestyle='--', label='Optimal')
     axes[0, 1].axvline(x=0.01, color='orange', linestyle=':', label='Current')
     axes[0, 1].set_xlabel('Delta (Stabilization Constant)')
@@ -530,7 +770,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     
     # pilot_ratio vs RMSE
     axes[0, 2].scatter(trials_df['params_pilot_ratio'], trials_df['rmse_only'], 
-                      alpha=0.5, s=30, c=trials_df['user_attrs_coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
+                      alpha=0.5, s=30, c=trials_df['coverage'], cmap='RdYlGn', vmin=0.85, vmax=1.0)
     axes[0, 2].axvline(x=best_params['pilot_ratio'], color='red', linestyle='--', label='Optimal')
     axes[0, 2].axvline(x=0.3, color='orange', linestyle=':', label='Current')
     axes[0, 2].set_xlabel('Pilot Ratio (r0 / r_total)')
@@ -541,7 +781,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     
     # Row 2: Each parameter vs Coverage
     # n_estimators vs Coverage
-    axes[1, 0].scatter(trials_df['params_n_estimators'], trials_df['user_attrs_coverage'], 
+    axes[1, 0].scatter(trials_df['params_n_estimators'], trials_df['coverage'], 
                       alpha=0.5, s=30, c=trials_df['rmse_only'], cmap='viridis_r')
     axes[1, 0].axhline(y=0.95, color='red', linestyle='--', label='Nominal 95%')
     axes[1, 0].axvline(x=best_params['n_estimators'], color='red', linestyle='--', alpha=0.5)
@@ -553,7 +793,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     axes[1, 0].set_ylim([0.7, 1.0])
     
     # delta vs Coverage
-    axes[1, 1].scatter(trials_df['params_delta'], trials_df['user_attrs_coverage'], 
+    axes[1, 1].scatter(trials_df['params_delta'], trials_df['coverage'], 
                       alpha=0.5, s=30, c=trials_df['rmse_only'], cmap='viridis_r')
     axes[1, 1].axhline(y=0.95, color='red', linestyle='--', label='Nominal 95%')
     axes[1, 1].axvline(x=best_params['delta'], color='red', linestyle='--', alpha=0.5)
@@ -566,7 +806,7 @@ def create_custom_analysis_plots(trials_df, scenario, best_params):
     axes[1, 1].set_ylim([0.7, 1.0])
     
     # pilot_ratio vs Coverage
-    axes[1, 2].scatter(trials_df['params_pilot_ratio'], trials_df['user_attrs_coverage'], 
+    axes[1, 2].scatter(trials_df['params_pilot_ratio'], trials_df['coverage'], 
                       alpha=0.5, s=30, c=trials_df['rmse_only'], cmap='viridis_r')
     axes[1, 2].axhline(y=0.95, color='red', linestyle='--', label='Nominal 95%')
     axes[1, 2].axvline(x=best_params['pilot_ratio'], color='red', linestyle='--', alpha=0.5)
@@ -830,33 +1070,51 @@ if __name__ == "__main__":
     N_TRIALS = 60            # More trials for multi-scenario (60-100 recommended)
     N_REPS = 10              # MC replications per trial per scenario
     AGGREGATION = 'mean'     # 'mean', 'max' (minimax), or 'weighted'
+    N_JOBS = -1              # Number of parallel CPUs (-1 = all available, 1 = sequential)
+    CHECKPOINT = True        # Enable checkpoint (save progress to database)
+    RESUME = True            # Resume from checkpoint if exists
     
     print(f"\nConfiguration:")
     print(f"  Mode:          {'Multi-scenario (ALL 4)' if MULTI_SCENARIO else 'Single scenario'}")
     print(f"  Aggregation:   {AGGREGATION}")
     print(f"  Trials:        {N_TRIALS}")
     print(f"  Replications:  {N_REPS} per scenario per trial")
+    print(f"  Parallel CPUs: {'All available' if N_JOBS == -1 else N_JOBS}")
+    print(f"  Checkpoint:    {'Enabled' if CHECKPOINT else 'Disabled'}")
+    print(f"  Resume:        {'Yes' if RESUME else 'No'}")
     
     if MULTI_SCENARIO:
-        print(f"  Total runs:    {N_TRIALS * N_REPS * 4} (4 scenarios)")
-        print(f"  Est. time:     ~{N_TRIALS * N_REPS * 4 * 2 / 60:.0f} minutes")
+        total_runs = N_TRIALS * N_REPS * 4
+        print(f"  Total runs:    {total_runs} (4 scenarios)")
+        import multiprocessing
+        n_cpus = multiprocessing.cpu_count() if N_JOBS == -1 else max(1, N_JOBS)
+        est_time = total_runs * 2 / 60 / n_cpus if N_JOBS != 1 else total_runs * 2 / 60
+        print(f"  Est. time:     ~{est_time:.0f} minutes (with {n_cpus} CPUs)")
     else:
         print(f"  Total runs:    {N_TRIALS * N_REPS}")
     
     print(f"\nNote: Optuna intelligently explores the space.")
     print(f"      {AGGREGATION.capitalize()} aggregation finds robust parameters across scenarios.")
+    if CHECKPOINT:
+        print(f"      Progress is auto-saved. Safe to interrupt (Ctrl+C) and resume later.")
     
     # Create optimizer
     optimizer = OSHyperparameterOptimizer(
         scenarios='all' if MULTI_SCENARIO else 'OBS-S',
         n_replications=N_REPS,
         r_total=10000,
-        aggregation=AGGREGATION
+        aggregation=AGGREGATION,
+        n_jobs=N_JOBS
     )
     
-    # Run optimization
+    # Run optimization with checkpoint support
     start_time = time.time()
-    study = optimizer.optimize(n_trials=N_TRIALS)
+    storage_file = f'optuna_{optimizer.scenario_name}.db' if CHECKPOINT else None
+    study = optimizer.optimize(
+        n_trials=N_TRIALS,
+        storage_name=storage_file,
+        resume=RESUME
+    )
     elapsed = time.time() - start_time
     
     print(f"\n✓ Optimization complete in {elapsed/60:.1f} minutes")
@@ -908,13 +1166,23 @@ if __name__ == "__main__":
     print("\n" + "="*80)
     print("ALL OUTPUTS SAVED")
     print("="*80)
+    
+    checkpoint_info = ""
+    if CHECKPOINT:
+        checkpoint_info = f"""
+    Checkpoint Database:
+      • {storage_file} - Study progress (can resume from this)
+      • To resume: Run script again with RESUME=True
+      • To restart: Delete this file or set RESUME=False
+    """
+    
     print(f"""
     CSV Files:
       • optuna_trials_{suffix}.csv - All trials data ({len(trials_df)} trials)
       • optimal_parameters_{suffix}.csv - Final recommendation
       • optimal_performance_by_scenario_{suffix}.csv - Per-scenario performance
-    
-    Optuna Plots (Interactive analysis):
+    {checkpoint_info}
+    Optimization Analysis Plots (matplotlib, server-friendly):
       • optuna_history_{suffix}.pdf - Optimization convergence
       • optuna_importance_{suffix}.pdf - Parameter importance ⭐ KEY
       • optuna_parallel_{suffix}.pdf - Parallel coordinate plot

@@ -22,6 +22,13 @@ N_POPULATION = 100000 # Population size N
 K_FOLDS = 2 # Number of folds for cross-fitting
 
 # =============================================================================
+# 1.1 ESTIMATOR CONFIGURATION
+# =============================================================================
+# Choose estimator for point estimation and variance estimation
+# Options: 'hajek' (default), 'hh' (Hansen-Hurwitz)
+ESTIMATOR_TYPE = 'hajek'  # Default to Hájek estimator
+
+# =============================================================================
 # 2. EXPERIMENT DEFINITIONS
 # =============================================================================
 
