@@ -102,6 +102,162 @@ def generate_summary_table(df, experiment_name):
     print(f"\nSummary table saved to {table_path}")
     return summary
 
+def process_results(results_list):
+    """Process results list and generate summary table."""
+    if not results_list:
+        return pd.DataFrame()
+    
+    # Convert results to DataFrame
+    df = pd.DataFrame(results_list)
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Calculate metrics
+    df['Coverage'] = (df['ci_lower'] <= df['true_ate']) & (df['true_ate'] <= df['ci_upper'])
+    df['CI_Width'] = df['ci_upper'] - df['ci_lower']
+    df['Bias'] = df['est_ate'] - df['true_ate']
+    df['Sq_Error'] = (df['est_ate'] - df['true_ate'])**2
+    
+    # Group by scenario and method
+    grouping_vars = ['scenario', 'method']
+    if 'misspecification' in df.columns:
+        grouping_vars = ['misspecification', 'method']
+    
+    summary = df.groupby(grouping_vars).agg(
+        Coverage=('Coverage', 'mean'),
+        CI_Width=('CI_Width', 'mean'),
+        Bias=('Bias', 'mean'),
+        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
+        Runtime=('runtime', 'mean')
+    ).reset_index()
+    
+    # Add AMSE Ratio and TNMSE for experiment 2
+    if 'scenario' in summary.columns and 'method' in summary.columns:
+        # AMSE Ratio (using RMSE as proxy for asymptotic variance)
+        unif_rmse = summary[summary['method'] == 'UNIF'].set_index('scenario')['RMSE']
+        summary['AMSE_Ratio'] = summary.apply(
+            lambda row: (unif_rmse.get(row['scenario'], np.nan) / row['RMSE'])**2 if row['method'] != 'UNIF' else 1.0,
+            axis=1
+        )
+        
+        # Time-Normalized MSE (TNMSE)
+        summary['TNMSE'] = summary['RMSE']**2 * summary['Runtime']
+    
+    # Sort by method order
+    method_order = ['OS', 'UNIF', 'LSS', 'FULL']
+    if 'method' in summary.columns:
+        summary['method'] = pd.Categorical(summary['method'], categories=method_order, ordered=True)
+        summary = summary.sort_values(grouping_vars)
+    
+    return summary
+
+def generate_latex_table(summary_df, experiment_name, output_dir):
+    """Generate LaTeX table for Overleaf."""
+    if summary_df.empty:
+        return
+    
+    # Create LaTeX table
+    latex_content = []
+    latex_content.append("\\begin{table}[htbp]")
+    latex_content.append("\\centering")
+    latex_content.append("\\caption{" + experiment_name.replace('_', ' ').title() + " Results}")
+    latex_content.append("\\label{tab:" + experiment_name + "}")
+    
+    # Determine columns based on experiment
+    if 'scenario' in summary_df.columns:
+        # Experiment 2: Main Comparison
+        latex_content.append("\\begin{tabular}{l" + "c" * (len(summary_df.columns) - 2) + "}")
+        latex_content.append("\\toprule")
+        
+        # Header
+        header = "Scenario & Method"
+        for col in summary_df.columns:
+            if col not in ['scenario', 'method']:
+                if col == 'Coverage':
+                    header += " & Coverage"
+                elif col == 'RMSE':
+                    header += " & RMSE"
+                elif col == 'Bias':
+                    header += " & Bias"
+                elif col == 'CI_Width':
+                    header += " & CI Width"
+                elif col == 'Runtime':
+                    header += " & Runtime (s)"
+                elif col == 'AMSE_Ratio':
+                    header += " & AMSE Ratio"
+                elif col == 'TNMSE':
+                    header += " & TNMSE"
+                else:
+                    header += f" & {col}"
+        header += " \\\\"
+        latex_content.append(header)
+        latex_content.append("\\midrule")
+        
+        # Data rows
+        for _, row in summary_df.iterrows():
+            line = f"{row['scenario']} & {row['method']}"
+            for col in summary_df.columns:
+                if col not in ['scenario', 'method']:
+                    if col in ['Coverage', 'RMSE', 'Bias', 'CI_Width', 'AMSE_Ratio', 'TNMSE']:
+                        line += f" & {row[col]:.4f}"
+                    elif col == 'Runtime':
+                        line += f" & {row[col]:.2f}"
+                    else:
+                        line += f" & {row[col]:.4f}"
+            line += " \\\\"
+            latex_content.append(line)
+    
+    elif 'misspecification' in summary_df.columns:
+        # Experiment 3: Robustness Check
+        latex_content.append("\\begin{tabular}{l" + "c" * (len(summary_df.columns) - 2) + "}")
+        latex_content.append("\\toprule")
+        
+        # Header
+        header = "Misspecification & Method"
+        for col in summary_df.columns:
+            if col not in ['misspecification', 'method']:
+                if col == 'Coverage':
+                    header += " & Coverage"
+                elif col == 'RMSE':
+                    header += " & RMSE"
+                elif col == 'Bias':
+                    header += " & Bias"
+                elif col == 'CI_Width':
+                    header += " & CI Width"
+                elif col == 'Runtime':
+                    header += " & Runtime (s)"
+                else:
+                    header += f" & {col}"
+        header += " \\\\"
+        latex_content.append(header)
+        latex_content.append("\\midrule")
+        
+        # Data rows
+        for _, row in summary_df.iterrows():
+            line = f"{row['misspecification']} & {row['method']}"
+            for col in summary_df.columns:
+                if col not in ['misspecification', 'method']:
+                    if col in ['Coverage', 'RMSE', 'Bias', 'CI_Width']:
+                        line += f" & {row[col]:.4f}"
+                    elif col == 'Runtime':
+                        line += f" & {row[col]:.2f}"
+                    else:
+                        line += f" & {row[col]:.4f}"
+            line += " \\\\"
+            latex_content.append(line)
+    
+    latex_content.append("\\bottomrule")
+    latex_content.append("\\end{tabular}")
+    latex_content.append("\\end{table}")
+    
+    # Save to file
+    latex_file = output_dir / f"{experiment_name}_table.tex"
+    with open(latex_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(latex_content))
+    
+    print(f"✓ LaTeX table saved to: {latex_file}")
+
 def main():
     """Main function to run the evaluation for all experiments."""
     scenarios, _, experiments = config.get_experiments()
