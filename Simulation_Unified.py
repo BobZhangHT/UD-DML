@@ -112,7 +112,7 @@ class OSHyperparameterOptimizer:
     def _run_os_with_params(self, data, n_estimators, delta, r0, r1, is_rct):
         N = len(data['Y_obs'])
         pilot_idx = np.random.choice(N, size=r0, replace=True)
-        lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': n_estimators, 'verbose': -1, 'feature_name': 'auto'}
+        lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': n_estimators, 'verbose': -1}
         
         X_p, W_p, Y_p = data['X'][pilot_idx], data['W'][pilot_idx], data['Y_obs'][pilot_idx]
         mu0 = lgb.LGBMRegressor(**lgbm_params).fit(X_p[W_p == 0], Y_p[W_p == 0]).predict(data['X'])
