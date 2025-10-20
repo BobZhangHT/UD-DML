@@ -120,7 +120,7 @@ def get_experiments():
             }
         },
         "experiment_3_robustness_check": {
-            "description": "Verifies bias reduction and double robustness of OS-DML under moderate heterogeneity DGPs.",
+            "description": "Verifies bias reduction and double robustness of OS-DML under moderate heterogeneity DGPs with four nuisance model specifications.",
             "scenarios": ['RCT-2', 'OBS-2'],  # Only moderate heterogeneity scenarios
             "methods": ['OS'],
             "base_dir": "./simulation_results/exp3_robustness_check",

@@ -18,9 +18,14 @@ Run this file or convert to notebook using: jupytext --to ipynb Simulation_Unifi
 # %%
 # Setup
 import warnings
+import os
 warnings.filterwarnings('ignore')
+# Additional suppression for LightGBM feature name warnings
+warnings.filterwarnings('ignore', message='X does not have valid feature names, but LGBM.* was fitted with feature names')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
+warnings.filterwarnings('ignore', message='.*feature names.*')
 
-import os, json, pickle, time, traceback, sys
+import json, pickle, time, traceback, sys
 from pathlib import Path
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
@@ -112,7 +117,7 @@ class OSHyperparameterOptimizer:
     def _run_os_with_params(self, data, n_estimators, delta, r0, r1, is_rct):
         N = len(data['Y_obs'])
         pilot_idx = np.random.choice(N, size=r0, replace=True)
-        lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': n_estimators, 'verbose': -1}
+        lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': n_estimators, 'verbose': -1, 'feature_name': None}
         
         X_p, W_p, Y_p = data['X'][pilot_idx], data['W'][pilot_idx], data['Y_obs'][pilot_idx]
         mu0 = lgb.LGBMRegressor(**lgbm_params).fit(X_p[W_p == 0], Y_p[W_p == 0]).predict(data['X'])
@@ -653,7 +658,12 @@ def run_experiment(exp_name, n_jobs=-1):
     print(f"✓ Saved summary table")
     
     # Generate LaTeX table
-    evaluation.generate_latex_table(summary_df, exp_name, output_dir)
+    if exp_name == 'experiment_3_robustness_check':
+        # For experiment 3, generate separate robustness tables
+        evaluation.generate_robustness_tables(results, output_dir)
+    else:
+        # For other experiments, generate standard LaTeX table
+        evaluation.generate_latex_table(summary_df, exp_name, output_dir)
     
     print(f"\\nSummary Table:")
     print(summary_df.to_string(index=False))

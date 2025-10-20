@@ -61,6 +61,12 @@ import lightgbm as lgb
 from sklearn.model_selection import KFold
 import config
 
+# Suppress LightGBM feature name warnings
+import warnings
+warnings.filterwarnings('ignore', message='X does not have valid feature names, but LGBM.* was fitted with feature names')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
+warnings.filterwarnings('ignore', message='.*feature names.*')
+
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
@@ -116,7 +122,7 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=config.BASE_SEED)
     
     lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 100, 
-                   'num_leaves': 31, 'verbose': -1}
+                   'num_leaves': 31, 'verbose': -1, 'feature_name': None}
     p_half = X.shape[1] // 2
 
     for train_idx, test_idx in kf.split(X):
@@ -388,7 +394,7 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     
     # Step 2: Fit cross-fitted nuisance models η^(0) on pilot data
     lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 
-                         'n_estimators': config.PILOT_N_ESTIMATORS, 'verbose': -1}
+                         'n_estimators': config.PILOT_N_ESTIMATORS, 'verbose': -1, 'feature_name': None}
     
     mu0_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
         X_pilot[W_pilot == 0], Y_pilot[W_pilot == 0])

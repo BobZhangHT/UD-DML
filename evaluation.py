@@ -279,6 +279,208 @@ def main():
 
     print(f"\nEvaluation complete.")
 
+def generate_robustness_tables(results_list, output_dir):
+    """Generate separate robustness tables for each scenario and a combined table."""
+    if not results_list:
+        return
+    
+    # Convert results to DataFrame
+    df = pd.DataFrame(results_list)
+    if df.empty:
+        return
+    
+    # Calculate metrics
+    df['Coverage'] = (df['ci_lower'] <= df['true_ate']) & (df['true_ate'] <= df['ci_upper'])
+    df['CI_Width'] = df['ci_upper'] - df['ci_lower']
+    df['Bias'] = df['est_ate'] - df['true_ate']
+    df['Sq_Error'] = (df['est_ate'] - df['true_ate'])**2
+    
+    # Get unique scenarios
+    scenarios = df['scenario'].unique()
+    
+    # Generate table for each scenario
+    for scenario in scenarios:
+        scenario_df = df[df['scenario'] == scenario]
+        
+        # Group by misspecification and method
+        summary = scenario_df.groupby(['misspecification', 'method']).agg(
+            Coverage=('Coverage', 'mean'),
+            CI_Width=('CI_Width', 'mean'),
+            Bias=('Bias', 'mean'),
+            RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
+            Runtime=('runtime', 'mean')
+        ).reset_index()
+        
+        # Generate LaTeX table for this scenario
+        generate_robustness_latex_table(summary, scenario, output_dir)
+        
+        # Generate formatted CSV table for this scenario
+        generate_robustness_csv_table(summary, scenario, output_dir)
+    
+    # Generate combined table
+    combined_summary = df.groupby(['scenario', 'misspecification', 'method']).agg(
+        Coverage=('Coverage', 'mean'),
+        CI_Width=('CI_Width', 'mean'),
+        Bias=('Bias', 'mean'),
+        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
+        Runtime=('runtime', 'mean')
+    ).reset_index()
+    
+    # Generate combined LaTeX table
+    generate_combined_robustness_latex_table(combined_summary, output_dir)
+    
+    # Generate combined CSV table with proper formatting
+    generate_combined_robustness_csv_table(combined_summary, output_dir)
+
+def generate_robustness_latex_table(summary_df, scenario, output_dir):
+    """Generate LaTeX table for a single scenario robustness check."""
+    latex_content = []
+    
+    # Table title
+    latex_content.append(f"\\begin{{table}}[h]")
+    latex_content.append(f"\\centering")
+    latex_content.append(f"\\caption{{Double robustness check for OS-DML under the {scenario} scenario.}}")
+    latex_content.append(f"\\label{{tab:robustness_{scenario.lower()}}}")
+    latex_content.append(f"\\begin{{tabular}}{{lccccc}}")
+    latex_content.append(f"\\toprule")
+    
+    # Header with multirow
+    latex_content.append(f"\\multirow{{2}}{{*}}{{Nuisance Models}} & \\multirow{{2}}{{*}}{{Method}} & \\multicolumn{{5}}{{c}}{{Performance Metrics}} \\\\")
+    latex_content.append(f"\\cmidrule(lr){{3-7}}")
+    latex_content.append(f"Outcome & Propensity & Coverage & CI Width & Bias & RMSE & Runtime (s) \\\\")
+    latex_content.append(f"\\midrule")
+    
+    # Data rows
+    for _, row in summary_df.iterrows():
+        misspec = row['misspecification']
+        method = row['method']
+        
+        # Parse misspecification
+        if misspec == 'correct_correct':
+            outcome, propensity = 'Correct', 'Correct'
+        elif misspec == 'correct_wrong':
+            outcome, propensity = 'Correct', 'Wrong'
+        elif misspec == 'wrong_correct':
+            outcome, propensity = 'Wrong', 'Correct'
+        elif misspec == 'wrong_wrong':
+            outcome, propensity = 'Wrong', 'Wrong'
+        else:
+            outcome, propensity = misspec, misspec
+        
+        line = f"{outcome} & {propensity} & {method} & {row['Coverage']:.2f} & {row['CI_Width']:.4f} & {row['Bias']:.4f} & {row['RMSE']:.4f} & {row['Runtime']:.2f} \\\\"
+        latex_content.append(line)
+    
+    latex_content.append(f"\\bottomrule")
+    latex_content.append(f"\\end{{tabular}}")
+    latex_content.append(f"\\end{{table}}")
+    
+    # Save to file
+    latex_file = output_dir / f"robustness_{scenario}_table.tex"
+    with open(latex_file, 'w') as f:
+        f.write('\n'.join(latex_content))
+    
+    print(f"✓ Generated LaTeX table for {scenario}: {latex_file}")
+
+def generate_robustness_csv_table(summary_df, scenario, output_dir):
+    """Generate CSV table for a single scenario robustness check with proper formatting."""
+    # Create a formatted DataFrame for CSV output
+    formatted_df = summary_df.copy()
+    
+    # Add Outcome and Propensity columns
+    formatted_df['Outcome'] = formatted_df['misspecification'].apply(
+        lambda x: 'Correct' if x in ['correct_correct', 'correct_wrong'] else 'Wrong'
+    )
+    formatted_df['Propensity'] = formatted_df['misspecification'].apply(
+        lambda x: 'Correct' if x in ['correct_correct', 'wrong_correct'] else 'Wrong'
+    )
+    
+    # Reorder columns to match the desired format
+    csv_df = formatted_df[['Outcome', 'Propensity', 'method', 'Coverage', 'CI_Width', 'Bias', 'RMSE', 'Runtime']].copy()
+    
+    # Rename columns for better readability
+    csv_df.columns = ['Outcome', 'Propensity', 'Method', 'Coverage', 'CI Width', 'Bias', 'RMSE', 'Runtime (s)']
+    
+    # Save CSV
+    csv_file = output_dir / f"robustness_{scenario}_table.csv"
+    csv_df.to_csv(csv_file, index=False)
+    print(f"✓ Generated CSV table for {scenario}: {csv_file}")
+    
+    return csv_df
+
+def generate_combined_robustness_latex_table(summary_df, output_dir):
+    """Generate combined LaTeX table for all scenarios robustness check."""
+    latex_content = []
+    
+    # Table title
+    latex_content.append(f"\\begin{{table}}[h]")
+    latex_content.append(f"\\centering")
+    latex_content.append(f"\\caption{{Combined double robustness check for OS-DML under RCT-2 and OBS-2 scenarios.}}")
+    latex_content.append(f"\\label{{tab:robustness_combined}}")
+    latex_content.append(f"\\begin{{tabular}}{{llccccc}}")
+    latex_content.append(f"\\toprule")
+    
+    # Header
+    latex_content.append(f"Scenario & Nuisance Models & Method & Coverage & CI Width & Bias & RMSE & Runtime (s) \\\\")
+    latex_content.append(f"\\midrule")
+    
+    # Data rows
+    for _, row in summary_df.iterrows():
+        scenario = row['scenario']
+        misspec = row['misspecification']
+        method = row['method']
+        
+        # Parse misspecification
+        if misspec == 'correct_correct':
+            nuisance_models = 'Correct-Correct'
+        elif misspec == 'correct_wrong':
+            nuisance_models = 'Correct-Wrong'
+        elif misspec == 'wrong_correct':
+            nuisance_models = 'Wrong-Correct'
+        elif misspec == 'wrong_wrong':
+            nuisance_models = 'Wrong-Wrong'
+        else:
+            nuisance_models = misspec
+        
+        line = f"{scenario} & {nuisance_models} & {method} & {row['Coverage']:.2f} & {row['CI_Width']:.4f} & {row['Bias']:.4f} & {row['RMSE']:.4f} & {row['Runtime']:.2f} \\\\"
+        latex_content.append(line)
+    
+    latex_content.append(f"\\bottomrule")
+    latex_content.append(f"\\end{{tabular}}")
+    latex_content.append(f"\\end{{table}}")
+    
+    # Save to file
+    latex_file = output_dir / "robustness_combined_table.tex"
+    with open(latex_file, 'w') as f:
+        f.write('\n'.join(latex_content))
+    
+    print(f"✓ Generated combined LaTeX table: {latex_file}")
+
+def generate_combined_robustness_csv_table(summary_df, output_dir):
+    """Generate combined CSV table for all scenarios robustness check with proper formatting."""
+    # Create a formatted DataFrame for CSV output
+    formatted_df = summary_df.copy()
+    
+    # Add Outcome and Propensity columns
+    formatted_df['Outcome'] = formatted_df['misspecification'].apply(
+        lambda x: 'Correct' if x in ['correct_correct', 'correct_wrong'] else 'Wrong'
+    )
+    formatted_df['Propensity'] = formatted_df['misspecification'].apply(
+        lambda x: 'Correct' if x in ['correct_correct', 'wrong_correct'] else 'Wrong'
+    )
+    
+    # Reorder columns to match the desired format
+    csv_df = formatted_df[['scenario', 'Outcome', 'Propensity', 'method', 'Coverage', 'CI_Width', 'Bias', 'RMSE', 'Runtime']].copy()
+    
+    # Rename columns for better readability
+    csv_df.columns = ['Scenario', 'Outcome', 'Propensity', 'Method', 'Coverage', 'CI Width', 'Bias', 'RMSE', 'Runtime (s)']
+    
+    # Save CSV
+    csv_file = output_dir / "robustness_combined_table.csv"
+    csv_df.to_csv(csv_file, index=False)
+    print(f"✓ Generated combined CSV table: {csv_file}")
+    
+    return csv_df
+
 if __name__ == "__main__":
     main()
 
