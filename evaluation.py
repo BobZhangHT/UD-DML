@@ -2,485 +2,378 @@
 """
 evaluation.py
 
-Loads results, calculates metrics, and generates summary tables.
-Now includes AMSE Ratio and Time-Normalized MSE (TNMSE).
+Redesigned analysis utilities for the OS-DML simulation suite.
+Responsible for:
+    - Converting replication outputs to tidy data frames
+    - Aggregating metrics required in the redesigned experiments
+    - Writing non-overlapping tables
+    - Generating complementary figures
+    - Persisting empirical pilot-ratio optima for downstream experiments
 All content is in English.
 """
+
+import json
+import math
 import os
-import pickle
-import pandas as pd
+from pathlib import Path
+from typing import Dict, Iterable, List
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+
 import config
 
-def load_results(results_dir, scenarios):
-    """Loads simulation results from a specific directory into a pandas DataFrame."""
-    # ... (code from previous turn, no changes needed here)
-    results_list = []
-    if not os.path.exists(results_dir):
-        print(f"Error: Results directory '{results_dir}' not found.")
+plt.switch_backend("Agg")
+
+
+# =============================================================================
+# Core data wrangling
+# =============================================================================
+
+METRIC_COLUMNS = ["Bias", "RMSE", "CI_Coverage", "CI_Width", "Runtime"]
+
+
+def _ensure_directories(base_dir: Path):
+    tables_dir = base_dir / "tables"
+    figures_dir = base_dir / "figures"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    return tables_dir, figures_dir
+
+
+def prepare_dataframe(results: List[Dict]) -> pd.DataFrame:
+    """Convert raw simulation outputs to a tidy DataFrame."""
+    if not results:
         return pd.DataFrame()
 
-    for scenario_name in os.listdir(results_dir):
-        scenario_dir = os.path.join(results_dir, scenario_name)
-        if not os.path.isdir(scenario_dir): continue
+    records = []
+    for res in results:
+        ci_lower = res.get("ci_lower")
+        ci_upper = res.get("ci_upper")
+        est_ate = res.get("est_ate")
+        true_ate = res.get("true_ate")
 
-        true_ate = np.nan
-        for file_name in os.listdir(scenario_dir):
-             if file_name.endswith(".pkl"):
-                try:
-                    with open(os.path.join(scenario_dir, file_name), 'rb') as f:
-                        res_sample = pickle.load(f)
-                        true_ate = res_sample.get('true_ate', np.nan)
-                        break 
-                except Exception:
-                    continue
-
-        for file_name in os.listdir(scenario_dir):
-            if not file_name.endswith(".pkl"): continue
-            
-            try:
-                with open(os.path.join(scenario_dir, file_name), 'rb') as f:
-                    res = pickle.load(f)
-                
-                est_ate, ci_lower, ci_upper = res.get('est_ate'), res.get('ci_lower'), res.get('ci_upper')
-                
-                if est_ate is not None and not np.isnan(est_ate) and ci_lower is not None and not np.isnan(ci_lower):
-                    res_dict = {
-                        "scenario": res.get('scenario'), "method": res.get('method'),
-                        "Coverage": (ci_lower <= true_ate) and (true_ate <= ci_upper),
-                        "CI_Width": ci_upper - ci_lower, "Bias": est_ate - true_ate,
-                        "Sq_Error": (est_ate - true_ate)**2,
-                        "Runtime": res.get('runtime', 0)
-                    }
-                    if 'pilot_ratio' in res: res_dict['pilot_ratio'] = res['pilot_ratio']
-                    if 'misspecification' in res: res_dict['misspecification'] = res['misspecification']
-                    results_list.append(res_dict)
-            except Exception as e:
-                print(f"Warning: Could not process {file_name}. Reason: {e}")
-
-    return pd.DataFrame(results_list)
-
-
-def generate_summary_table(df, experiment_name):
-    """Generates a summary table with standard and new efficiency metrics."""
-    if df.empty: return None
-        
-    grouping_vars = ['scenario', 'method']
-    if 'pilot_ratio' in df.columns: grouping_vars = ['pilot_ratio', 'method', 'scenario']
-    if 'misspecification' in df.columns: grouping_vars = ['misspecification', 'method']
-
-    summary = df.groupby(grouping_vars).agg(
-        Coverage=('Coverage', 'mean'), 
-        CI_Width=('CI_Width', 'mean'),
-        Bias=('Bias', 'mean'), 
-        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
-        Runtime=('Runtime', 'mean')
-    ).reset_index()
-    
-    # --- New Metrics ---
-    if 'method' in summary.columns and 'scenario' in summary.columns and experiment_name == "experiment_2_main_comparison":
-        # 1. AMSE Ratio (using RMSE as a proxy for asymptotic variance)
-        unif_rmse = summary[summary['method'] == 'UNIF'].set_index('scenario')['RMSE']
-        summary['AMSE_Ratio'] = summary.apply(
-            lambda row: (unif_rmse.get(row['scenario'], np.nan) / row['RMSE'])**2 if row['method'] != 'UNIF' else 1.0,
-            axis=1
-        )
-        
-        # 2. Time-Normalized MSE (TNMSE)
-        summary['TNMSE'] = summary['RMSE']**2 * summary['Runtime']
-
-    analysis_dir = f"./analysis_results/{experiment_name}"
-    os.makedirs(analysis_dir, exist_ok=True)
-    
-    method_order = ['OS', 'UNIF', 'LSS', 'FULL']
-    if 'method' in summary.columns:
-        summary['method'] = pd.Categorical(summary['method'], categories=method_order, ordered=True)
-        summary = summary.sort_values(grouping_vars)
-    
-    table_path = os.path.join(analysis_dir, "summary_table.csv")
-    summary.to_csv(table_path, index=False, float_format="%.4f")
-    print(f"\nSummary table saved to {table_path}")
-    return summary
-
-def process_results(results_list):
-    """Process results list and generate summary table."""
-    if not results_list:
-        return pd.DataFrame()
-    
-    # Convert results to DataFrame
-    df = pd.DataFrame(results_list)
-    
-    if df.empty:
-        return pd.DataFrame()
-    
-    # Calculate metrics
-    df['Coverage'] = (df['ci_lower'] <= df['true_ate']) & (df['true_ate'] <= df['ci_upper'])
-    df['CI_Width'] = df['ci_upper'] - df['ci_lower']
-    df['Bias'] = df['est_ate'] - df['true_ate']
-    df['Sq_Error'] = (df['est_ate'] - df['true_ate'])**2
-    
-    # Group by scenario and method
-    grouping_vars = ['scenario', 'method']
-    if 'misspecification' in df.columns:
-        grouping_vars = ['misspecification', 'method']
-    
-    summary = df.groupby(grouping_vars).agg(
-        Coverage=('Coverage', 'mean'),
-        CI_Width=('CI_Width', 'mean'),
-        Bias=('Bias', 'mean'),
-        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
-        Runtime=('runtime', 'mean')
-    ).reset_index()
-    
-    # Add AMSE Ratio and TNMSE for experiment 2
-    if 'scenario' in summary.columns and 'method' in summary.columns:
-        # AMSE Ratio (using RMSE as proxy for asymptotic variance)
-        unif_rmse = summary[summary['method'] == 'UNIF'].set_index('scenario')['RMSE']
-        summary['AMSE_Ratio'] = summary.apply(
-            lambda row: (unif_rmse.get(row['scenario'], np.nan) / row['RMSE'])**2 if row['method'] != 'UNIF' else 1.0,
-            axis=1
-        )
-        
-        # Time-Normalized MSE (TNMSE)
-        summary['TNMSE'] = summary['RMSE']**2 * summary['Runtime']
-    
-    # Sort by method order
-    method_order = ['OS', 'UNIF', 'LSS', 'FULL']
-    if 'method' in summary.columns:
-        summary['method'] = pd.Categorical(summary['method'], categories=method_order, ordered=True)
-        summary = summary.sort_values(grouping_vars)
-    
-    return summary
-
-def generate_latex_table(summary_df, experiment_name, output_dir):
-    """Generate LaTeX table for Overleaf."""
-    if summary_df.empty:
-        return
-    
-    # Create LaTeX table
-    latex_content = []
-    latex_content.append("\\begin{table}[htbp]")
-    latex_content.append("\\centering")
-    latex_content.append("\\caption{" + experiment_name.replace('_', ' ').title() + " Results}")
-    latex_content.append("\\label{tab:" + experiment_name + "}")
-    
-    # Determine columns based on experiment
-    if 'scenario' in summary_df.columns:
-        # Experiment 2: Main Comparison
-        latex_content.append("\\begin{tabular}{l" + "c" * (len(summary_df.columns) - 2) + "}")
-        latex_content.append("\\toprule")
-        
-        # Header
-        header = "Scenario & Method"
-        for col in summary_df.columns:
-            if col not in ['scenario', 'method']:
-                if col == 'Coverage':
-                    header += " & Coverage"
-                elif col == 'RMSE':
-                    header += " & RMSE"
-                elif col == 'Bias':
-                    header += " & Bias"
-                elif col == 'CI_Width':
-                    header += " & CI Width"
-                elif col == 'Runtime':
-                    header += " & Runtime (s)"
-                elif col == 'AMSE_Ratio':
-                    header += " & AMSE Ratio"
-                elif col == 'TNMSE':
-                    header += " & TNMSE"
-                else:
-                    header += f" & {col}"
-        header += " \\\\"
-        latex_content.append(header)
-        latex_content.append("\\midrule")
-        
-        # Data rows
-        for _, row in summary_df.iterrows():
-            line = f"{row['scenario']} & {row['method']}"
-            for col in summary_df.columns:
-                if col not in ['scenario', 'method']:
-                    if col in ['Coverage', 'RMSE', 'Bias', 'CI_Width', 'AMSE_Ratio', 'TNMSE']:
-                        line += f" & {row[col]:.4f}"
-                    elif col == 'Runtime':
-                        line += f" & {row[col]:.2f}"
-                    else:
-                        line += f" & {row[col]:.4f}"
-            line += " \\\\"
-            latex_content.append(line)
-    
-    elif 'misspecification' in summary_df.columns:
-        # Experiment 3: Robustness Check
-        latex_content.append("\\begin{tabular}{l" + "c" * (len(summary_df.columns) - 2) + "}")
-        latex_content.append("\\toprule")
-        
-        # Header
-        header = "Misspecification & Method"
-        for col in summary_df.columns:
-            if col not in ['misspecification', 'method']:
-                if col == 'Coverage':
-                    header += " & Coverage"
-                elif col == 'RMSE':
-                    header += " & RMSE"
-                elif col == 'Bias':
-                    header += " & Bias"
-                elif col == 'CI_Width':
-                    header += " & CI Width"
-                elif col == 'Runtime':
-                    header += " & Runtime (s)"
-                else:
-                    header += f" & {col}"
-        header += " \\\\"
-        latex_content.append(header)
-        latex_content.append("\\midrule")
-        
-        # Data rows
-        for _, row in summary_df.iterrows():
-            line = f"{row['misspecification']} & {row['method']}"
-            for col in summary_df.columns:
-                if col not in ['misspecification', 'method']:
-                    if col in ['Coverage', 'RMSE', 'Bias', 'CI_Width']:
-                        line += f" & {row[col]:.4f}"
-                    elif col == 'Runtime':
-                        line += f" & {row[col]:.2f}"
-                    else:
-                        line += f" & {row[col]:.4f}"
-            line += " \\\\"
-            latex_content.append(line)
-    
-    latex_content.append("\\bottomrule")
-    latex_content.append("\\end{tabular}")
-    latex_content.append("\\end{table}")
-    
-    # Save to file
-    latex_file = output_dir / f"{experiment_name}_table.tex"
-    with open(latex_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(latex_content))
-    
-    print(f"✓ LaTeX table saved to: {latex_file}")
-
-def main():
-    """Main function to run the evaluation for all experiments."""
-    scenarios, _, experiments = config.get_experiments()
-    
-    for exp_name, exp_config in experiments.items():
-        print(f"\n--- Evaluating: {exp_name} ---")
-        results_df = load_results(exp_config['base_dir'], scenarios)
-        
-        if results_df.empty:
-            print(f"No valid simulation results found for '{exp_name}'.")
+        if est_ate is None or true_ate is None:
             continue
 
-        print("Generating summary table...")
-        summary_table = generate_summary_table(results_df, exp_name)
-        
-        if summary_table is not None:
-            print(f"\n--- {exp_name} Summary Table ---")
-            print(summary_table.to_string(index=False, float_format="%.4f"))
+        record = {
+            "exp_name": res.get("exp_name"),
+            "scenario": res.get("scenario"),
+            "method": res.get("method"),
+            "sim_id": res.get("sim_id"),
+            "pilot_ratio": res.get("pilot_ratio"),
+            "pilot_ratio_strategy": res.get("pilot_ratio_strategy"),
+            "r0": res.get("r0"),
+            "r1": res.get("r1"),
+            "r_total": res.get("r_total"),
+            "population_size": res.get("population_size"),
+            "delta": res.get("delta"),
+            "variant_label": res.get("variant_label"),
+            "n_estimators": res.get("n_estimators"),
+            "k_folds": res.get("k_folds"),
+            "misspecification": res.get("misspecification"),
+            "runtime": res.get("runtime"),
+            "est_ate": est_ate,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "true_ate": true_ate,
+        }
 
-    print(f"\nEvaluation complete.")
+        record["Bias"] = est_ate - true_ate
+        record["Sq_Error"] = record["Bias"] ** 2
+        record["RMSE_rep"] = abs(record["Bias"])  # used for distributional plots
+        if ci_lower is not None and ci_upper is not None:
+            record["CI_Coverage"] = float(ci_lower <= true_ate <= ci_upper)
+            record["CI_Width"] = ci_upper - ci_lower
+        else:
+            record["CI_Coverage"] = np.nan
+            record["CI_Width"] = np.nan
+        records.append(record)
 
-def generate_robustness_tables(results_list, output_dir):
-    """Generate separate robustness tables for each scenario and a combined table."""
-    if not results_list:
-        return
-    
-    # Convert results to DataFrame
-    df = pd.DataFrame(results_list)
-    if df.empty:
-        return
-    
-    # Calculate metrics
-    df['Coverage'] = (df['ci_lower'] <= df['true_ate']) & (df['true_ate'] <= df['ci_upper'])
-    df['CI_Width'] = df['ci_upper'] - df['ci_lower']
-    df['Bias'] = df['est_ate'] - df['true_ate']
-    df['Sq_Error'] = (df['est_ate'] - df['true_ate'])**2
-    
-    # Get unique scenarios
-    scenarios = df['scenario'].unique()
-    
-    # Generate table for each scenario
-    for scenario in scenarios:
-        scenario_df = df[df['scenario'] == scenario]
-        
-        # Group by misspecification and method
-        summary = scenario_df.groupby(['misspecification', 'method']).agg(
-            Coverage=('Coverage', 'mean'),
-            CI_Width=('CI_Width', 'mean'),
-            Bias=('Bias', 'mean'),
-            RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
-            Runtime=('runtime', 'mean')
-        ).reset_index()
-        
-        # Generate LaTeX table for this scenario
-        generate_robustness_latex_table(summary, scenario, output_dir)
-        
-        # Generate formatted CSV table for this scenario
-        generate_robustness_csv_table(summary, scenario, output_dir)
-    
-    # Generate combined table
-    combined_summary = df.groupby(['scenario', 'misspecification', 'method']).agg(
-        Coverage=('Coverage', 'mean'),
-        CI_Width=('CI_Width', 'mean'),
-        Bias=('Bias', 'mean'),
-        RMSE=('Sq_Error', lambda x: np.sqrt(x.mean())),
-        Runtime=('runtime', 'mean')
+    return pd.DataFrame(records)
+
+
+def _aggregate_metrics(df: pd.DataFrame, group_cols: Iterable[str]) -> pd.DataFrame:
+    grouped = df.groupby(list(group_cols), dropna=False)
+    summary = grouped.agg(
+        Bias=("Bias", "mean"),
+        RMSE=("Sq_Error", lambda x: math.sqrt(x.mean()) if len(x) else np.nan),
+        CI_Coverage=("CI_Coverage", "mean"),
+        CI_Width=("CI_Width", "mean"),
+        Runtime=("runtime", "mean"),
+        Replications=("sim_id", "count"),
     ).reset_index()
-    
-    # Generate combined LaTeX table
-    generate_combined_robustness_latex_table(combined_summary, output_dir)
-    
-    # Generate combined CSV table with proper formatting
-    generate_combined_robustness_csv_table(combined_summary, output_dir)
+    return summary
 
-def generate_robustness_latex_table(summary_df, scenario, output_dir):
-    """Generate LaTeX table for a single scenario robustness check."""
-    latex_content = []
-    
-    # Table title
-    latex_content.append(f"\\begin{{table}}[h]")
-    latex_content.append(f"\\centering")
-    latex_content.append(f"\\caption{{Double robustness check for OS-DML under the {scenario} scenario.}}")
-    latex_content.append(f"\\label{{tab:robustness_{scenario.lower()}}}")
-    latex_content.append(f"\\begin{{tabular}}{{lccccc}}")
-    latex_content.append(f"\\toprule")
-    
-    # Header with multirow
-    latex_content.append(f"\\multirow{{2}}{{*}}{{Nuisance Models}} & \\multirow{{2}}{{*}}{{Method}} & \\multicolumn{{5}}{{c}}{{Performance Metrics}} \\\\")
-    latex_content.append(f"\\cmidrule(lr){{3-7}}")
-    latex_content.append(f"Outcome & Propensity & Coverage & CI Width & Bias & RMSE & Runtime (s) \\\\")
-    latex_content.append(f"\\midrule")
-    
-    # Data rows
-    for _, row in summary_df.iterrows():
-        misspec = row['misspecification']
-        method = row['method']
-        
-        # Parse misspecification
-        if misspec == 'correct_correct':
-            outcome, propensity = 'Correct', 'Correct'
-        elif misspec == 'correct_wrong':
-            outcome, propensity = 'Correct', 'Wrong'
-        elif misspec == 'wrong_correct':
-            outcome, propensity = 'Wrong', 'Correct'
-        elif misspec == 'wrong_wrong':
-            outcome, propensity = 'Wrong', 'Wrong'
-        else:
-            outcome, propensity = misspec, misspec
-        
-        line = f"{outcome} & {propensity} & {method} & {row['Coverage']:.2f} & {row['CI_Width']:.4f} & {row['Bias']:.4f} & {row['RMSE']:.4f} & {row['Runtime']:.2f} \\\\"
-        latex_content.append(line)
-    
-    latex_content.append(f"\\bottomrule")
-    latex_content.append(f"\\end{{tabular}}")
-    latex_content.append(f"\\end{{table}}")
-    
-    # Save to file
-    latex_file = output_dir / f"robustness_{scenario}_table.tex"
-    with open(latex_file, 'w') as f:
-        f.write('\n'.join(latex_content))
-    
-    print(f"✓ Generated LaTeX table for {scenario}: {latex_file}")
 
-def generate_robustness_csv_table(summary_df, scenario, output_dir):
-    """Generate CSV table for a single scenario robustness check with proper formatting."""
-    # Create a formatted DataFrame for CSV output
-    formatted_df = summary_df.copy()
-    
-    # Add Outcome and Propensity columns
-    formatted_df['Outcome'] = formatted_df['misspecification'].apply(
-        lambda x: 'Correct' if x in ['correct_correct', 'correct_wrong'] else 'Wrong'
+# =============================================================================
+# Experiment-specific reporting
+# =============================================================================
+
+def _pilot_ratio_reports(df: pd.DataFrame, analysis_dir: Path, params: Dict):
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+
+    coverage_threshold = params.get("coverage_threshold", 0.93)
+    summary = _aggregate_metrics(
+        df,
+        ["scenario", "method", "pilot_ratio"],
+    ).sort_values(["scenario", "method", "pilot_ratio"])
+    summary.to_csv(tables_dir / "pilot_ratio_summary.csv", index=False)
+
+    optima = []
+    for scenario in summary["scenario"].unique():
+        subset = summary[(summary["scenario"] == scenario) & (summary["method"] == "OS")]
+        feasible = subset[subset["CI_Coverage"] >= coverage_threshold]
+        candidate = feasible.sort_values("RMSE").head(1)
+        if candidate.empty:
+            candidate = subset.sort_values("RMSE").head(1)
+        if not candidate.empty:
+            row = candidate.iloc[0]
+            optima.append({"scenario": scenario, "pilot_ratio": float(row["pilot_ratio"])})
+
+    optima_df = pd.DataFrame(optima)
+    optima_df.to_csv(tables_dir / "pilot_ratio_optima.csv", index=False, float_format="%.2f")
+    optima_map = {row["scenario"]: row["pilot_ratio"] for _, row in optima_df.iterrows()}
+    if optima_map:
+        empirical_file = tables_dir / "pilot_ratio_optima.json"
+        with open(empirical_file, "w") as f:
+            json.dump(optima_map, f, indent=2)
+
+    # Plots
+    for metric, ylabel in [("RMSE", "RMSE"), ("CI_Coverage", "Coverage")]:
+        plt.figure(figsize=(12, 6))
+        for scenario in sorted(df["scenario"].unique()):
+            subset = summary[(summary["scenario"] == scenario) & (summary["method"] == "OS")]
+            plt.plot(
+                subset["pilot_ratio"],
+                subset[metric],
+                marker="o",
+                label=scenario,
+            )
+        plt.xlabel("Pilot Ratio")
+        plt.ylabel(ylabel)
+        plt.title(f"Pilot Ratio vs {ylabel}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(figures_dir / f"pilot_ratio_{metric.lower()}.png", dpi=200)
+        plt.close()
+
+
+def _subsample_budget_reports(df: pd.DataFrame, analysis_dir: Path):
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+    summary = _aggregate_metrics(df, ["scenario", "method", "r_total"])
+
+    # Baseline comparison (r_total == 1000 if available)
+    baseline = summary[summary["r_total"] == 1000][["scenario", "method", "RMSE", "CI_Coverage"]]
+    baseline = baseline.rename(
+        columns={"RMSE": "RMSE_baseline", "CI_Coverage": "Coverage_baseline"}
     )
-    formatted_df['Propensity'] = formatted_df['misspecification'].apply(
-        lambda x: 'Correct' if x in ['correct_correct', 'wrong_correct'] else 'Wrong'
+    merged = summary.merge(baseline, on=["scenario", "method"], how="left")
+    merged["RMSE_pct_change"] = 100 * (
+        (merged["RMSE"] / merged["RMSE_baseline"]) - 1.0
     )
-    
-    # Reorder columns to match the desired format
-    csv_df = formatted_df[['Outcome', 'Propensity', 'method', 'Coverage', 'CI_Width', 'Bias', 'RMSE', 'Runtime']].copy()
-    
-    # Rename columns for better readability
-    csv_df.columns = ['Outcome', 'Propensity', 'Method', 'Coverage', 'CI Width', 'Bias', 'RMSE', 'Runtime (s)']
-    
-    # Save CSV
-    csv_file = output_dir / f"robustness_{scenario}_table.csv"
-    csv_df.to_csv(csv_file, index=False)
-    print(f"✓ Generated CSV table for {scenario}: {csv_file}")
-    
-    return csv_df
+    merged["Coverage_diff"] = merged["CI_Coverage"] - merged["Coverage_baseline"]
+    merged["Runtime_per_draw"] = merged["Runtime"] / merged["r_total"].replace(0, np.nan)
+    merged.to_csv(tables_dir / "subsample_budget_summary.csv", index=False)
 
-def generate_combined_robustness_latex_table(summary_df, output_dir):
-    """Generate combined LaTeX table for all scenarios robustness check."""
-    latex_content = []
-    
-    # Table title
-    latex_content.append(f"\\begin{{table}}[h]")
-    latex_content.append(f"\\centering")
-    latex_content.append(f"\\caption{{Combined double robustness check for OS-DML under RCT-2 and OBS-2 scenarios.}}")
-    latex_content.append(f"\\label{{tab:robustness_combined}}")
-    latex_content.append(f"\\begin{{tabular}}{{llccccc}}")
-    latex_content.append(f"\\toprule")
-    
-    # Header
-    latex_content.append(f"Scenario & Nuisance Models & Method & Coverage & CI Width & Bias & RMSE & Runtime (s) \\\\")
-    latex_content.append(f"\\midrule")
-    
-    # Data rows
-    for _, row in summary_df.iterrows():
-        scenario = row['scenario']
-        misspec = row['misspecification']
-        method = row['method']
-        
-        # Parse misspecification
-        if misspec == 'correct_correct':
-            nuisance_models = 'Correct-Correct'
-        elif misspec == 'correct_wrong':
-            nuisance_models = 'Correct-Wrong'
-        elif misspec == 'wrong_correct':
-            nuisance_models = 'Wrong-Correct'
-        elif misspec == 'wrong_wrong':
-            nuisance_models = 'Wrong-Wrong'
-        else:
-            nuisance_models = misspec
-        
-        line = f"{scenario} & {nuisance_models} & {method} & {row['Coverage']:.2f} & {row['CI_Width']:.4f} & {row['Bias']:.4f} & {row['RMSE']:.4f} & {row['Runtime']:.2f} \\\\"
-        latex_content.append(line)
-    
-    latex_content.append(f"\\bottomrule")
-    latex_content.append(f"\\end{{tabular}}")
-    latex_content.append(f"\\end{{table}}")
-    
-    # Save to file
-    latex_file = output_dir / "robustness_combined_table.tex"
-    with open(latex_file, 'w') as f:
-        f.write('\n'.join(latex_content))
-    
-    print(f"✓ Generated combined LaTeX table: {latex_file}")
+    # Pareto scatter
+    plt.figure(figsize=(10, 6))
+    for method, marker in zip(["OS", "UNIF", "LSS", "FULL"], ["o", "s", "^", "D"]):
+        subset = merged[merged["method"] == method]
+        plt.scatter(
+            subset["Runtime"],
+            subset["RMSE"],
+            label=method,
+            marker=marker,
+        )
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("Runtime (s)")
+    plt.ylabel("RMSE")
+    plt.title("Runtime vs RMSE across subsample budgets")
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(figures_dir / "subsample_budget_runtime_rmse.png", dpi=200)
+    plt.close()
 
-def generate_combined_robustness_csv_table(summary_df, output_dir):
-    """Generate combined CSV table for all scenarios robustness check with proper formatting."""
-    # Create a formatted DataFrame for CSV output
-    formatted_df = summary_df.copy()
-    
-    # Add Outcome and Propensity columns
-    formatted_df['Outcome'] = formatted_df['misspecification'].apply(
-        lambda x: 'Correct' if x in ['correct_correct', 'correct_wrong'] else 'Wrong'
+
+def _population_scaling_reports(df: pd.DataFrame, analysis_dir: Path):
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+    summary = _aggregate_metrics(df, ["scenario", "method", "population_size"])
+    summary.to_csv(tables_dir / "population_scaling_by_method.csv", index=False)
+
+    avg_summary = _aggregate_metrics(df, ["scenario", "population_size"])
+    avg_summary = avg_summary.rename(columns={"Bias": "Bias_avg", "RMSE": "RMSE_avg"})
+    avg_summary.to_csv(tables_dir / "population_scaling_mean_over_methods.csv", index=False)
+
+    # Deltas relative to baseline population
+    baseline_size = 100_000
+    baseline = summary[summary["population_size"] == baseline_size][
+        ["scenario", "method", "RMSE", "Runtime"]
+    ].rename(columns={"RMSE": "RMSE_baseline", "Runtime": "Runtime_baseline"})
+    merged = summary.merge(baseline, on=["scenario", "method"], how="left")
+    merged["RMSE_log_ratio"] = np.log(merged["RMSE"] / merged["RMSE_baseline"])
+    merged["Runtime_log_ratio"] = np.log(merged["Runtime"] / merged["Runtime_baseline"])
+    merged.to_csv(tables_dir / "population_scaling_with_deltas.csv", index=False)
+
+    # Plots: RMSE vs N, Runtime vs N
+    for method in sorted(summary["method"].unique()):
+        subset = summary[summary["method"] == method]
+        plt.figure(figsize=(10, 6))
+        for scenario in sorted(subset["scenario"].unique()):
+            scen_df = subset[subset["scenario"] == scenario].sort_values("population_size")
+            plt.plot(
+                scen_df["population_size"],
+                scen_df["RMSE"],
+                marker="o",
+                label=scenario,
+            )
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel("Population size (N)")
+        plt.ylabel("RMSE")
+        plt.title(f"RMSE scaling with N ({method})")
+        plt.grid(True, which="both", ls="--", alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(figures_dir / f"population_scaling_rmse_{method}.png", dpi=200)
+        plt.close()
+
+    plt.figure(figsize=(10, 6))
+    for scenario in sorted(summary["scenario"].unique()):
+        scen_df = summary[summary["scenario"] == scenario].sort_values("population_size")
+        runtime_mean = scen_df.groupby("population_size")["Runtime"].mean().reset_index()
+        plt.plot(
+            runtime_mean["population_size"],
+            runtime_mean["Runtime"],
+            marker="o",
+            label=scenario,
+        )
+    plt.xscale("log")
+    plt.xlabel("Population size (N)")
+    plt.ylabel("Runtime (s)")
+    plt.title("Runtime scaling with N (averaged across methods)")
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(figures_dir / "population_scaling_runtime.png", dpi=200)
+    plt.close()
+
+
+def _double_robustness_reports(df: pd.DataFrame, analysis_dir: Path):
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+    summary = _aggregate_metrics(df, ["scenario", "misspecification", "method"])
+    summary.to_csv(tables_dir / "double_robustness_summary.csv", index=False)
+
+    # Pivot into Outcome/Propensity grid
+    def _split_misspec(code):
+        if code == "correct_correct":
+            return "Correct", "Correct"
+        if code == "correct_wrong":
+            return "Correct", "Wrong"
+        if code == "wrong_correct":
+            return "Wrong", "Correct"
+        return "Wrong", "Wrong"
+
+    summary["Outcome"], summary["Propensity"] = zip(
+        *summary["misspecification"].map(_split_misspec)
     )
-    formatted_df['Propensity'] = formatted_df['misspecification'].apply(
-        lambda x: 'Correct' if x in ['correct_correct', 'wrong_correct'] else 'Wrong'
+    formatted = summary[
+        ["scenario", "Outcome", "Propensity", "method", "Bias", "RMSE", "CI_Coverage", "CI_Width", "Runtime"]
+    ]
+    formatted.to_csv(tables_dir / "double_robustness_formatted.csv", index=False)
+
+    ww = summary[summary["misspecification"] == "wrong_wrong"]
+    ww = ww.sort_values("CI_Coverage")
+    ww[["scenario", "method", "CI_Coverage"]].to_csv(
+        tables_dir / "double_robustness_coverage_shortfall.csv", index=False
     )
-    
-    # Reorder columns to match the desired format
-    csv_df = formatted_df[['scenario', 'Outcome', 'Propensity', 'method', 'Coverage', 'CI_Width', 'Bias', 'RMSE', 'Runtime']].copy()
-    
-    # Rename columns for better readability
-    csv_df.columns = ['Scenario', 'Outcome', 'Propensity', 'Method', 'Coverage', 'CI Width', 'Bias', 'RMSE', 'Runtime (s)']
-    
-    # Save CSV
-    csv_file = output_dir / "robustness_combined_table.csv"
-    csv_df.to_csv(csv_file, index=False)
-    print(f"✓ Generated combined CSV table: {csv_file}")
-    
-    return csv_df
 
-if __name__ == "__main__":
-    main()
+    # Heatmap-style plot using pivot tables
+    for scenario in sorted(summary["scenario"].unique()):
+        scen_df = summary[summary["scenario"] == scenario]
+        pivot = scen_df.pivot_table(
+            index="Outcome", columns="Propensity", values="CI_Coverage", aggfunc="mean"
+        )
+        plt.figure(figsize=(5, 4))
+        plt.imshow(pivot.values, vmin=0, vmax=1, cmap="viridis")
+        plt.colorbar(label="Coverage")
+        plt.xticks(range(len(pivot.columns)), pivot.columns)
+        plt.yticks(range(len(pivot.index)), pivot.index)
+        plt.title(f"Coverage heatmap ({scenario})")
+        for i in range(pivot.shape[0]):
+            for j in range(pivot.shape[1]):
+                plt.text(
+                    j,
+                    i,
+                    f"{pivot.values[i, j]:.2f}",
+                    ha="center",
+                    va="center",
+                    color="white" if pivot.values[i, j] < 0.5 else "black",
+                )
+        plt.tight_layout()
+        plt.savefig(figures_dir / f"double_robustness_coverage_{scenario}.png", dpi=200)
+        plt.close()
 
+    # Bias distribution violin plots (combined)
+    plt.figure(figsize=(12, 6))
+    order = ["correct_correct", "correct_wrong", "wrong_correct", "wrong_wrong"]
+    df["misspecification"] = pd.Categorical(df["misspecification"], categories=order, ordered=True)
+    bias_data = df[df["method"] == "OS"]
+    bias_summary = bias_data.groupby(["scenario", "misspecification"])["Bias"].apply(list)
+    positions = np.arange(len(bias_summary))
+    plt.violinplot(
+        bias_summary.tolist(),
+        positions=positions,
+        showmeans=True,
+    )
+    labels = [f"{sc}\n{miss}" for sc, miss in bias_summary.index]
+    plt.xticks(positions, labels, rotation=45, ha="right")
+    plt.ylabel("Bias distribution")
+    plt.title("Bias distribution across misspecification scenarios (OS)")
+    plt.tight_layout()
+    plt.savefig(figures_dir / "double_robustness_bias_violin.png", dpi=200)
+    plt.close()
+
+
+# =============================================================================
+# Public entry point
+# =============================================================================
+
+def generate_reports(exp_name: str, results: List[Dict], output_dir: Path) -> Dict[str, Path]:
+    """
+    Produce experiment-specific tables and plots.
+
+    Returns
+    -------
+    dict
+        Keys: 'tables_dir', 'figures_dir'
+    """
+    analysis_dir = Path("./analysis_results") / exp_name
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+
+    df = prepare_dataframe(results)
+    if df.empty:
+        print(f"No valid results to analyse for {exp_name}.")
+        return {"tables_dir": tables_dir, "figures_dir": figures_dir}
+
+    df.to_csv(analysis_dir / "replication_level_metrics.csv", index=False)
+
+    if exp_name == "experiment_pilot_ratio_sweep":
+        # Deduplicate method to OS only
+        df = df[df["method"] == "OS"]
+        _pilot_ratio_reports(df, analysis_dir, config.get_experiments()[2][exp_name]["params"])
+    elif exp_name == "experiment_subsample_budget":
+        _subsample_budget_reports(df, analysis_dir)
+    elif exp_name == "experiment_population_scaling":
+        _population_scaling_reports(df, analysis_dir)
+    elif exp_name == "experiment_double_robustness":
+        _double_robustness_reports(df, analysis_dir)
+    else:
+        summary = _aggregate_metrics(df, ["scenario", "method"])
+        summary.to_csv(tables_dir / "summary_table.csv", index=False)
+
+    return {"tables_dir": tables_dir, "figures_dir": figures_dir}

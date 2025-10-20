@@ -89,8 +89,9 @@ def _orthogonal_score(Y, W, mu0, mu1, e):
     """
     return mu1 - mu0 + (W / e) * (Y - mu1) - ((1 - W) / (1 - e)) * (Y - mu0)
 
-def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None, 
-                         sample_weight=None, misspecification=None):
+def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
+                         sample_weight=None, misspecification=None,
+                         n_estimators=None):
     """
     Performs K-fold cross-fitting for nuisance functions η = (μ₀, μ₁, e).
     
@@ -121,7 +122,8 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
     
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=config.BASE_SEED)
     
-    lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': 100, 
+    trees = n_estimators or config.LGBM_N_ESTIMATORS
+    lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': trees,
                    'num_leaves': 31, 'verbose': -1, 'feature_name': None}
     p_half = X.shape[1] // 2
 
@@ -138,9 +140,13 @@ def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
             lr1 = LinearRegression().fit(X_train[W_train == 1, :p_half], Y_train[W_train == 1])
             mu1_preds[test_idx] = lr1.predict(X_test[:, :p_half])
         else:
-            lgbm0 = lgb.LGBMRegressor(**lgbm_params).fit(X_train[W_train == 0], Y_train[W_train == 0], sample_weight=weights_train[W_train == 0] if weights_train is not None else None)
+            lgbm0 = lgb.LGBMRegressor(**lgbm_params).fit(
+                X_train[W_train == 0], Y_train[W_train == 0],
+                sample_weight=weights_train[W_train == 0] if weights_train is not None else None)
             mu0_preds[test_idx] = lgbm0.predict(X_test)
-            lgbm1 = lgb.LGBMRegressor(**lgbm_params).fit(X_train[W_train == 1], Y_train[W_train == 1], sample_weight=weights_train[W_train == 1] if weights_train is not None else None)
+            lgbm1 = lgb.LGBMRegressor(**lgbm_params).fit(
+                X_train[W_train == 1], Y_train[W_train == 1],
+                sample_weight=weights_train[W_train == 1] if weights_train is not None else None)
             mu1_preds[test_idx] = lgbm1.predict(X_test)
         
         # Propensity score model
@@ -308,8 +314,18 @@ def run_full(X, W, Y_obs, pi_true, is_rct, k_folds, **kwargs):
     """
     start_time = time.time()
     misspecification = kwargs.get('misspecification')
-    mu0, mu1, e = _fit_nuisance_models(X, W, Y_obs, k_folds, is_rct, np.mean(W), 
-                                        misspecification=misspecification)
+    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
+    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
+    mu0, mu1, e = _fit_nuisance_models(
+        X,
+        W,
+        Y_obs,
+        k_folds,
+        is_rct,
+        np.mean(W),
+        misspecification=misspecification,
+        n_estimators=n_estimators_override,
+    )
     scores = _orthogonal_score(Y_obs, W, mu0, mu1, e)
     est_ate, ci_lower, ci_upper = _get_full_data_ci(scores)
     return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
@@ -341,9 +357,17 @@ def run_unif(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     
     # Fit nuisance models with importance weights
     weights = 1.0 / q_j
-    mu0, mu1, e = _fit_nuisance_models(X_sub, W_sub, Y_sub, k_folds, is_rct, 
-                                        np.mean(W_sub), sample_weight=weights, 
-                                        misspecification=misspecification)
+    mu0, mu1, e = _fit_nuisance_models(
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        np.mean(W_sub),
+        sample_weight=weights,
+        misspecification=misspecification,
+        n_estimators=n_estimators_override,
+    )
     scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
     
     # Estimator and inference (Hájek or Hansen-Hurwitz)
@@ -373,17 +397,23 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     start_time = time.time()
     N = len(Y_obs)
     
+    misspecification = kwargs.get('misspecification')
+    delta = kwargs.get('delta', config.DELTA)
+    pilot_ratio = kwargs.get('pilot_ratio', config.DEFAULT_PILOT_RATIO)
+    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
+    
     # Handle both old format (r0, r1) and new format (r_total)
     if 'r_total' in r:
         r_total = r['r_total']
-        r0 = int(r_total * config.PILOT_RATIO)
-        r1 = r_total - r0
+        r0 = max(1, int(round(r_total * pilot_ratio)))
+        r1 = max(1, r_total - r0)
+        if r0 + r1 != r_total:
+            r1 = r_total - r0
     else:
         r0, r1 = r['r0'], r['r1']
+        r_total = r0 + r1
+        pilot_ratio = r0 / r_total if r_total > 0 else pilot_ratio
     
-    misspecification = kwargs.get('misspecification')
-    delta = config.DELTA  # Use global delta parameter
-
     # =========================================================================
     # PHASE 1: PILOT ESTIMATION AND PROBABILITY CONSTRUCTION (Algorithm 1, Steps 1-4)
     # =========================================================================
@@ -393,8 +423,13 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     X_pilot, W_pilot, Y_pilot = X[pilot_idx], W[pilot_idx], Y_obs[pilot_idx]
     
     # Step 2: Fit cross-fitted nuisance models η^(0) on pilot data
-    lgbm_params_pilot = {'n_jobs': 1, 'random_state': config.BASE_SEED, 
-                         'n_estimators': config.PILOT_N_ESTIMATORS, 'verbose': -1, 'feature_name': None}
+    lgbm_params_pilot = {
+        'n_jobs': 1,
+        'random_state': config.BASE_SEED,
+        'n_estimators': n_estimators_override,
+        'verbose': -1,
+        'feature_name': None,
+    }
     
     mu0_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
         X_pilot[W_pilot == 0], Y_pilot[W_pilot == 0])
@@ -449,9 +484,17 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     
     # Step 6 (continued): Fit final nuisance models with importance weights ω_t ∝ 1/q_{I_t}
     weights = 1.0 / q_j
-    mu0, mu1, e = _fit_nuisance_models(X_c, W_c, Y_c, k_folds, is_rct, 
-                                        np.mean(W_c), sample_weight=weights, 
-                                        misspecification=misspecification)
+    mu0, mu1, e = _fit_nuisance_models(
+        X_c,
+        W_c,
+        Y_c,
+        k_folds,
+        is_rct,
+        np.mean(W_c),
+        sample_weight=weights,
+        misspecification=misspecification,
+        n_estimators=n_estimators_override,
+    )
     
     # Step 7: Compute final estimated pseudo-outcomes
     scores = _orthogonal_score(Y_c, W_c, mu0, mu1, e)
@@ -464,8 +507,17 @@ def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwar
     est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
     
     runtime = time.time() - start_time
-    return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
-            "runtime": runtime}
+    return {
+        "est_ate": est_ate,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "runtime": runtime,
+        "pilot_ratio_used": pilot_ratio,
+        "r0": r0,
+        "r1": r1,
+        "r_total": r_total,
+        "delta_used": delta,
+    }
 
 def run_os(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     """
@@ -527,7 +579,8 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
         r_total = r['r0'] + r['r1']
     
     misspecification = kwargs.get('misspecification')
-    delta = config.DELTA  # Use global delta parameter
+    delta = kwargs.get('delta', config.DELTA)
+    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
     
     # =========================================================================
     # SINGLE-STAGE LEVERAGE SCORE SAMPLING
@@ -558,9 +611,17 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     
     # Fit nuisance models with importance weights
     weights = 1.0 / q_j
-    mu0, mu1, e = _fit_nuisance_models(X_sub, W_sub, Y_sub, k_folds, is_rct, 
-                                        np.mean(W_sub), sample_weight=weights, 
-                                        misspecification=misspecification)
+    mu0, mu1, e = _fit_nuisance_models(
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        np.mean(W_sub),
+        sample_weight=weights,
+        misspecification=misspecification,
+        n_estimators=n_estimators_override,
+    )
     
     # Compute pseudo-outcomes
     scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
@@ -571,4 +632,3 @@ def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
     runtime = time.time() - start_time
     return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
             "runtime": runtime}
-

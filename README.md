@@ -91,81 +91,56 @@ result_full = run_full(X, W, Y_obs, pi_true, is_rct, k_folds=2)
 
 ## Running Simulation Experiments
 
-The codebase includes a **unified simulation script** that runs all three experiments automatically:
+The redesigned study offers four complementary experiment families orchestrated by `Simulation_Unified.py`. Every run checkpoint-checks each Monte Carlo replication, writes raw outputs under `simulation_results/`, and exports tables plus plots to `analysis_results/`.
 
-### Run Complete Simulation Study
+### Launching experiments
 
 ```bash
-# Recommended: Run as Python script
+# Run all experiments with automatic parallelisation
 python Simulation_Unified.py
+
+# Run a specific subset
+python Simulation_Unified.py --experiments experiment_pilot_ratio_sweep experiment_double_robustness
+
+# Limit CPU usage
+python Simulation_Unified.py --jobs 8
 ```
 
-This will automatically:
-1. **Experiment 1: Sensitivity Analysis** - Find optimal hyperparameters via Bayesian optimization
-   - Generates 7 PDF visualization plots
-   - Auto-saves progress (resumable if interrupted)
-2. **Auto-update config.py** - Apply optimal parameters globally
-3. **Experiment 2: Main Comparison** - Compare OS, UNIF, LSS, FULL across 4 DGPs (using optimal params)
-   - Parallel computation across all CPUs
-   - Checkpoint support (resumable if interrupted)
-4. **Experiment 3: Robustness Check** - Test double robustness under misspecification (using optimal params)
-   - Parallel computation across all CPUs
-   - Checkpoint support (resumable if interrupted)
+### Experiment catalogue
 
-**Key Features:**
-- ⚡ **Parallel Computation**: Automatically uses all CPU cores (6-8× faster)
-- 🔄 **Checkpoint Support**: Resume from interruption without data loss
-- 📊 **Auto-Visualization**: 7 PDF plots generated for Experiment 1
-- 🛡️ **Fault Tolerant**: Safe to interrupt (Ctrl+C) and resume later
+1. **experiment_pilot_ratio_sweep** �C Sweeps OS pilot ratios (0.10�C0.90) with a fixed subsample budget across all six DGPs. Generates scenario-level metric tables and stores the empirical pilot ratio that satisfies the coverage floor.
+2. **experiment_subsample_budget** �C Benchmarks OS, UNIF, LSS, and FULL for total subsample sizes {250, 500, 1000, 2000, 4000}. Reports runtime-normalised efficiency tables and runtime�Cprecision frontier plots.
+3. **experiment_population_scaling** �C Explores population-size scaling (N �� {25k,��,400k}) while holding the subsample budget fixed. Produces method-level and averaged tables plus log�Clog accuracy/runtime charts.
+4. **experiment_double_robustness** �C Extends the four nuisance specifications (correct/correct �� wrong/wrong) to every DGP. Outputs formatted 2��2 tables, coverage shortfall rankings, coverage heatmaps, and bias violins.
 
-### Experiments Included
-
-1. **Experiment 1: Sensitivity Analysis**
-   - Bayesian optimization (Optuna) across all scenarios
-   - Search space: `n_estimators` [20, 100], `delta` [10^-4, 10^-1], `pilot_ratio` [0.1, 0.9]
-   - Finds optimal hyperparameters that minimize RMSE while maintaining 95% coverage
-   - Outputs: `optimal_parameters.json`, 7 PDF visualization plots
-   - Features: Parallel trial execution, auto-resume from checkpoint
-
-2. **Experiment 2: Main Comparison**
-   - Compares OS, UNIF, LSS, FULL across 4 DGPs (RCT-S, RCT-C, OBS-S, OBS-C)
-   - Uses optimal hyperparameters from Experiment 1
-   - Outputs: Performance metrics (RMSE, Coverage, Bias, Runtime)
-   - Features: Parallel computation, per-replication checkpoints
-
-3. **Experiment 3: Robustness Check**
-   - Tests OS-DML under model misspecification (OBS-C scenario)
-   - Four conditions: correct/wrong outcome model × correct/wrong propensity model
-   - Verifies double robustness property
-   - Features: Parallel computation, per-replication checkpoints
+**Runtime features**
+- ? Parallel execution via `--jobs` (default: all logical cores)
+- ?? Resume-friendly checkpoints per replication
+- ?? Automatic tables + plots with non-overlapping content
+- ?? Empirical pilot-ratio optima persisted in `analysis_results/experiment_pilot_ratio_sweep/tables/`
 
 ### Configuration
 
-Edit `config.py` to modify global parameters:
+Edit `config.py` to adjust global parameters and experiment grids. Key settings include:
 
 ```python
-# General settings
-N_SIM = 50                     # Monte Carlo replications
-N_POPULATION = 1000000         # Population size (updated to 1M)
-K_FOLDS = 2                    # Cross-fitting folds
+BASE_SEED = 20250919
+DEFAULT_REPLICATIONS = 200
+N_POPULATION = 100_000
+K_FOLDS = 2
 
-# OS-DML algorithm parameters (auto-updated by Experiment 1)
-PILOT_RATIO = 0.3              # Pilot sample ratio
-DELTA = 0.01                   # Stabilization constant
-PILOT_N_ESTIMATORS = 30        # Pilot GBM complexity
+ESTIMATOR_TYPE = "hajek"      # switch to "hh" for Hansen-Hurwitz
+DELTA = 0.005466              # stabilisation constant for sampling probs
+DEFAULT_PILOT_RATIO = 0.80
+LGBM_N_ESTIMATORS = 50        # shared across pilot and final nuisance fits
 
-# Estimator choice
-ESTIMATOR_TYPE = 'hajek'       # 'hajek' (default) or 'hh' (Hansen-Hurwitz)
-
-# Experiment 1 optimization settings
-"experiment_1_sensitivity_analysis": {
-    "n_trials": 60,            # Optuna trials
-    "n_replications": 10,      # MC reps per trial
-    "n_jobs": -1,              # Parallel CPUs (-1 = all)
-    "checkpoint": True,        # Enable auto-save
-    "resume": True             # Resume from checkpoint
-}
+PILOT_RATIO_GRID = [...]
+SUBSAMPLE_TOTALS = [...]
+POPULATION_SIZE_GRID = [...]
+ROBUSTNESS_MISSPECIFICATIONS = [...]
 ```
+
+Each experiment entry returned by `get_experiments()` specifies its scenarios, methods, base directory, and parameter grid. Update those dictionaries to customise the study.
 
 ---
 
@@ -181,16 +156,16 @@ OS-DML/
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
 ├── simulation_results/       # Output directory (auto-created)
-│   ├── exp1_sensitivity_analysis/
-│   │   ├── optimal_parameters.json
-│   │   ├── trials.csv
-│   │   └── optuna_all_scenarios.db
-│   ├── exp2_main_comparison/
-│   │   ├── raw_results.pkl
-│   │   └── summary_table.csv
-│   └── exp3_robustness_check/
-│       ├── raw_results.pkl
-│       └── summary_table.csv
+�?  ├── exp1_sensitivity_analysis/
+�?  �?  ├── optimal_parameters.json
+�?  �?  ├── trials.csv
+�?  �?  └── optuna_all_scenarios.db
+�?  ├── exp2_main_comparison/
+�?  �?  ├── raw_results.pkl
+�?  �?  └── summary_table.csv
+�?  └── exp3_robustness_check/
+�?      ├── raw_results.pkl
+�?      └── summary_table.csv
 └── analysis_results/         # Processed results (auto-created)
 ```
 
@@ -205,8 +180,8 @@ After running simulations, results are automatically saved:
 - `trials.csv` - All optimization trials
 - `optuna_all_scenarios.db` - Optuna study database (auto-resume checkpoint)
 - **7 PDF Visualization Plots:**
-  - `parameter_importance.pdf` ⭐ - Which hyperparameters matter most
-  - `hyperparameter_analysis.pdf` ⭐ - 9-panel comprehensive analysis
+  - `parameter_importance.pdf` �?- Which hyperparameters matter most
+  - `hyperparameter_analysis.pdf` �?- 9-panel comprehensive analysis
   - `optimization_history.pdf` - Convergence over trials
   - `parallel_coordinate.pdf` - Parameter combination space
   - `contour_gbm_delta.pdf` - GBM × Delta interaction
@@ -295,10 +270,10 @@ ESTIMATOR_TYPE = 'hajek'   # 'hajek' (Hájek estimator) or 'hh' (Hansen-Hurwitz)
 
 ### Sample Size Selection
 - **Pilot size (r₀):** Experiment 1 optimizes, typically 30-50% of total budget
-- **Main size (r₁):** Remaining budget
-- **Total (r₀ + r₁):** Generally 5-10% of population N
+- **Main size (r�?:** Remaining budget
+- **Total (r₀ + r�?:** Generally 5-10% of population N
 
-**Example:** For N=1,000,000, use `r_total=10,000` → automatically splits based on `PILOT_RATIO`
+**Example:** For N=1,000,000, use `r_total=10,000` �?automatically splits based on `PILOT_RATIO`
 
 ### Key Parameters
 - `delta`: Stabilization constant for centered optimal sampling probabilities (optimized)
@@ -340,23 +315,23 @@ OS-DML implements a two-phase procedure with centered optimal sampling:
 
 1. **Phase 1 (Pilot Stage):**
    - Draw pilot sample of size r₀ uniformly from population N
-   - Fit nuisance models (μ₀, μ₁, e) on pilot data
+   - Fit nuisance models (μ₀, μ�? e) on pilot data
    - Predict pseudo-outcomes φ̂ᵢ⁽⁰⁾ on full population
-   - Compute centered sampling probabilities: pᵢ ∝ |φ̂ᵢ⁽⁰⁾ - φ̄⁽⁰⁾| + δ
+   - Compute centered sampling probabilities: p�?�?|φ̂ᵢ⁽⁰⁾ - φ̄⁽⁰⁾| + δ
 
 2. **Phase 2 (Main Stage):**
-   - Draw main sample of size r₁ via importance sampling with probabilities pᵢ
+   - Draw main sample of size r�?via importance sampling with probabilities p�?
    - Combine pilot and main samples
    - Refit nuisance models with importance weights
-   - Compute final pseudo-outcomes φ̂ⱼ
+   - Compute final pseudo-outcomes φ̂�?
 
 3. **Inference:**
-   - Hájek estimator (default): τ̂_HJ = Σⱼ(φ̂ⱼ/qⱼ) / Σⱼ(1/qⱼ)
-   - Plug-in variance: Var(τ̂_HJ) = (1/(r·N²)) · (1/(r-1)) · Σₜ(Uₜ - Ū)²
+   - Hájek estimator (default): τ̂_HJ = Σ�?φ̂�?q�? / Σ�?1/q�?
+   - Plug-in variance: Var(τ̂_HJ) = (1/(r·N²)) · (1/(r-1)) · Σ�?U�?- Ū)²
    - Hansen-Hurwitz also available via `ESTIMATOR_TYPE = 'hh'`
 
 ### Key Innovations
-- **Centered probabilities**: Use |φ̂ᵢ - φ̄| instead of |φ̂ᵢ| for better variance reduction
+- **Centered probabilities**: Use |φ̂�?- φ̄| instead of |φ̂ᵢ| for better variance reduction
 - **Hájek estimator**: Ratio estimator more efficient than Hansen-Hurwitz
 - **Automated tuning**: Bayesian optimization finds optimal δ, pilot_ratio, n_estimators
 
@@ -368,7 +343,7 @@ For detailed algorithm description and theoretical properties, see the paper.
 
 ### Computational Efficiency
 - **Speed**: 5-10× faster than full-data DML for N > 100,000
-- **Memory**: Processes only r ≈ 0.1N samples instead of full N
+- **Memory**: Processes only r �?0.1N samples instead of full N
 - **Scalability**: Handles datasets with N > 1,000,000
 
 ### Statistical Efficiency
@@ -382,18 +357,18 @@ For detailed algorithm description and theoretical properties, see the paper.
 - **Checkpoint**: Resumable optimization for long-running studies
 
 ### When to Use OS-DML
-- ✅ Large datasets (N > 100,000)
-- ✅ Limited computational resources
-- ✅ Need for fast inference
-- ✅ Both RCT and observational data
+- �?Large datasets (N > 100,000)
+- �?Limited computational resources
+- �?Need for fast inference
+- �?Both RCT and observational data
 
 ### Comparison to Alternatives
 | Method | RMSE | Coverage | Runtime | Memory |
 |--------|------|----------|---------|--------|
-| **OS-DML** | ⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ |
-| UNIF | ⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐ |
-| LSS | ⭐⭐ | ⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐ |
-| FULL | ⭐⭐⭐ | ⭐⭐⭐ | ⭐ | ⭐ |
+| **OS-DML** | ⭐⭐�?| ⭐⭐�?| ⭐⭐�?| ⭐⭐�?|
+| UNIF | ⭐⭐ | ⭐⭐�?| ⭐⭐�?| ⭐⭐�?|
+| LSS | ⭐⭐ | ⭐⭐�?| ⭐⭐ | ⭐⭐�?|
+| FULL | ⭐⭐�?| ⭐⭐�?| �?| �?|
 
 ---
 
