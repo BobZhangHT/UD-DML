@@ -1,634 +1,502 @@
 # -*- coding: utf-8 -*-
 """
-methods.py - OS-DML Implementation
+methods.py - UD-DML Implementation
 
-Implements Algorithm 1: Two-Stage Optimal Subsampling DML (OS-DML) and benchmark methods.
+Implements Algorithm 1 from UD_DML.pdf: Uniform Design Double Machine Learning (UD-DML)
+alongside benchmark routines.
 
 =============================================================================
-ALGORITHM 1 OVERVIEW: Two-Stage Optimal Subsampling DML (OS-DML)
+ALGORITHM OVERVIEW: Uniform Design Double Machine Learning (UD-DML)
 =============================================================================
 
-OS-DML is a computationally efficient method for estimating average treatment effects (ATE)
-from large-scale datasets using double/debiased machine learning with optimal subsampling.
+UD-DML targets efficient estimation of causal parameters with double/debiased machine
+learning when the full sample is massive. The method first constructs a subsample via
+uniform design (UD) using stratified low-discrepancy points and nearest-neighbour matching,
+then runs cross-fitted DML on the resulting subset.
 
-KEY INNOVATION:
-Instead of uniform subsampling, OS-DML uses importance sampling proportional to the absolute
-value of influence functions |φ_i^(0)|, which optimally allocates samples to observations
-that contribute most to estimation uncertainty.
+PHASE 1: UD-MMD SUBSAMPLING
+    1. Map covariates X to [0, 1]^p with empirical CDF transforms (probability integral transform).
+    2. Draw Latin-hypercube skeleton points v_j in [0, 1]^p.
+    3. For each skeleton point, locate the nearest treated unit and the nearest control unit
+       without replacement (paired design) to obtain a balanced subsample.
 
-ALGORITHM STRUCTURE:
+PHASE 2: CROSS-FITTED DML ON SUBSAMPLE
+    4. Perform K-fold cross-fitting on the UD-selected subset.
+    5. Compute Neyman-orthogonal pseudo outcomes (AIPW score for the ATE).
 
-Phase 1: Pilot Estimation and Probability Construction (Steps 1-4)
-    1. Draw uniform pilot subsample S_0 of size r_0
-    2. Fit cross-fitted nuisance models η^(0) = (μ₀, μ₁, e) on pilot data
-    3. Predict pseudo-outcomes φ_i^(0) for ALL N observations in full dataset
-    4. Compute centered pseudo-outcomes and construct stabilized sampling probabilities:
-       φ̂̄^(0) = N^(-1) * Σ_i φ̂_i^(0) (average over full data)
-       p_i ∝ |φ̂_i^(0) - φ̂̄^(0)| + δ (centered and stabilized)
-
-Phase 2: Main Subsampling and Final Estimation (Steps 5-8)
-    5. Draw main subsample S_1 of size r_1 using probabilities {p_i}
-    6. Form combined subsample S_comb = S_0 ∪ S_1 with importance weights
-    7. Fit final cross-fitted nuisance models on combined subsample
-    8. Compute estimator (Hájek or Hansen-Hurwitz):
-       Hájek: τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
-       Hansen-Hurwitz: τ_HH = (1/(N*r)) * Σ_t (φ_{I_t} / q_{I_t})
-       where q_{I_t} = 1/N for pilot draws, q_{I_t} = p_{I_t} for PPS draws
-
-Inference (Steps 9-10)
-    9-10. Compute variance:
-       Hájek: Plug-in variance Var(τ̂_HJ) = (1/(r*N²)) * (1/(r-1)) * Σ_t(U_t - Ū)²
-             where U_t = (φ̂_t - τ̂_HJ) / q_t and Ū = r^(-1) * Σ_t U_t
-       Hansen-Hurwitz: Design-based variance Var(τ_HH) = (1/(N²*r)) * (1/(r-1)) * Σ_t(H_t - H̄)²
-
-THEORETICAL PROPERTIES:
-- Design-unbiased for estimated finite-population mean
-- √r-consistent with asymptotic normality
-- Variance reduction compared to uniform subsampling
-- Double robustness inherited from DML framework
+INFERENCE
+    - Point estimate: sample average of the pseudo outcomes.
+    - Variance: empirical variance of pseudo outcomes scaled by 1/r.
+    - Confidence interval: Wald interval using asymptotic normality.
 
 BENCHMARK METHODS IMPLEMENTED:
-- FULL: Full-data DML (gold standard)
-- UNIF: Uniform subsampling DML
-- LSS: Leverage score subsampling DML
-- OS: Optimal subsampling DML (Algorithm 1)
+    - FULL: Full-data DML (gold standard)
+    - UNIF: Simple uniform subsampling DML (without replacement)
+    - UD: Uniform Design subsampling via MMD with stratified uniform draws (proposed)
 
 All content is in English.
 """
 import time
+import warnings
+from typing import Optional, Tuple
+
 import numpy as np
 import lightgbm as lgb
+from numba import njit
+from scipy.spatial import cKDTree
 from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.linear_model import LassoCV, LogisticRegression, LogisticRegressionCV
+from sklearn.preprocessing import StandardScaler
+
 import config
 
-# Suppress LightGBM feature name warnings
-import warnings
-warnings.filterwarnings('ignore', message='X does not have valid feature names, but LGBM.* was fitted with feature names')
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.utils.validation')
 warnings.filterwarnings('ignore', message='.*feature names.*')
+warnings.filterwarnings('ignore', message='X does not have valid feature names')
+
+_CI_Z = 1.96
+
 
 # =============================================================================
-# HELPER FUNCTIONS
+# NUMBA-ACCELERATED UTILITIES FOR UD SUBSAMPLING
 # =============================================================================
 
-def _orthogonal_score(Y, W, mu0, mu1, e):
-    """
-    Computes the Neyman-orthogonal score (pseudo-outcome) φ for the ATE.
-    
-    Formula: φ(Z; η) = μ₁(X) - μ₀(X) + W/e(X) * (Y - μ₁(X)) - (1-W)/(1-e(X)) * (Y - μ₀(X))
-    
-    Args:
-        Y: Observed outcomes
-        W: Treatment indicators
-        mu0: Estimated E[Y|X,W=0]
-        mu1: Estimated E[Y|X,W=1]
-        e: Estimated propensity score P(W=1|X)
-    
-    Returns:
-        Array of pseudo-outcomes (influence functions)
-    """
-    return mu1 - mu0 + (W / e) * (Y - mu1) - ((1 - W) / (1 - e)) * (Y - mu0)
+@njit
+def _rank_transform_numba(X: np.ndarray, clip: float) -> np.ndarray:
+    """Compute marginal ranks and rescale them to (0, 1) with optional clipping."""
+    n, p = X.shape
+    out = np.empty((n, p), dtype=np.float64)
+    denom = n + 1.0
+    for j in range(p):
+        col = X[:, j]
+        order = np.argsort(col)
+        ranks = np.empty(n, dtype=np.int64)
+        for pos in range(n):
+            ranks[order[pos]] = pos + 1
+        for i in range(n):
+            val = ranks[i] / denom
+            if val < clip:
+                val = clip
+            elif val > 1.0 - clip:
+                val = 1.0 - clip
+            out[i, j] = val
+    return out
 
-def _fit_nuisance_models(X, W, Y, k_folds, is_rct, pi_rct_val=None,
-                         sample_weight=None, misspecification=None,
-                         n_estimators=None):
-    """
-    Performs K-fold cross-fitting for nuisance functions η = (μ₀, μ₁, e).
-    
-    This is a key component of DML that ensures the Neyman-orthogonality property.
-    Cross-fitting eliminates overfitting bias by training on one fold and predicting
-    on another.
-    
-    Args:
-        X: Covariates (n x p)
-        W: Treatment indicators (n,)
-        Y: Observed outcomes (n,)
-        k_folds: Number of folds for cross-fitting
-        is_rct: If True, propensity score e(X) is known constant
-        pi_rct_val: Value of constant propensity score for RCT (if is_rct=True)
-        sample_weight: Importance weights for each observation (for subsampling methods)
-        misspecification: Scenario for robustness checks ('correct_correct', 
-                         'correct_wrong', 'wrong_correct', 'wrong_wrong')
-    
-    Returns:
-        Tuple of (mu0_preds, mu1_preds, e_preds):
-        - mu0_preds: E[Y|X,W=0] predictions for all n observations
-        - mu1_preds: E[Y|X,W=1] predictions for all n observations
-        - e_preds: P(W=1|X) predictions for all n observations (clipped to [0.01, 0.99])
-    """
-    mu0_preds = np.zeros(len(Y))
-    mu1_preds = np.zeros(len(Y))
-    e_preds = np.zeros(len(Y))
-    
+# =============================================================================
+# GENERAL DML HELPER FUNCTIONS
+# =============================================================================
+
+
+def _orthogonal_score(Y: np.ndarray, W: np.ndarray, mu0: np.ndarray, mu1: np.ndarray, e: np.ndarray) -> np.ndarray:
+    """Compute the AIPW pseudo-outcome for the ATE."""
+    return mu1 - mu0 + (W / e) * (Y - mu1) - ((1.0 - W) / (1.0 - e)) * (Y - mu0)
+
+
+def _fit_nuisance_models(
+    X: np.ndarray,
+    W: np.ndarray,
+    Y: np.ndarray,
+    k_folds: int,
+    is_rct: bool,
+    pi_rct_val: Optional[float] = None,
+    sample_weight: Optional[np.ndarray] = None,
+    misspecification: Optional[str] = None,
+    n_estimators: Optional[int] = None,
+    learner: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cross-fitted nuisance estimation mirroring the original OS-DML implementation."""
+    n = Y.shape[0]
+    mu0_preds = np.zeros(n)
+    mu1_preds = np.zeros(n)
+    e_preds = np.zeros(n)
+
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=config.BASE_SEED)
-    
-    trees = n_estimators or config.LGBM_N_ESTIMATORS
-    lgbm_params = {'n_jobs': 1, 'random_state': config.BASE_SEED, 'n_estimators': trees,
-                   'num_leaves': 31, 'verbose': -1, 'feature_name': None}
+
+    n_estimators = n_estimators or getattr(config, 'LGBM_N_ESTIMATORS', 100)
+    max_depth = getattr(config, 'LGBM_MAX_DEPTH', 5)
+    learning_rate = getattr(config, 'LGBM_LEARNING_RATE', 0.1)
+    num_leaves = getattr(config, 'LGBM_NUM_LEAVES', 31)
     p_half = X.shape[1] // 2
+    learner = (learner or getattr(config, 'DEFAULT_NUISANCE_LEARNER', 'lgbm')).lower()
+    if learner in ('lasso', 'lassocv'):
+        learner = 'lasso_cv'
+    rf_trees = getattr(config, 'RF_N_TREES', 200)
+    rf_jobs = getattr(config, 'RF_N_JOBS', 1)
+    lasso_cv_folds = getattr(config, 'LASSO_CV_FOLDS', 5)
+    lasso_cv_max_iter = getattr(config, 'LASSO_CV_MAX_ITER', 5000)
+    logit_cv_max_iter = getattr(config, 'LOGIT_CV_MAX_ITER', 5000)
+    logit_cv_scoring = getattr(config, 'LOGIT_CV_SCORING', 'neg_log_loss')
+    logit_cv_cs = getattr(config, 'LOGIT_CV_CS', None)
 
     for train_idx, test_idx in kf.split(X):
         X_train, Y_train, W_train = X[train_idx], Y[train_idx], W[train_idx]
         X_test = X[test_idx]
         weights_train = sample_weight[train_idx] if sample_weight is not None else None
 
-        # Outcome models
         if misspecification in ['wrong_correct', 'wrong_wrong']:
             from sklearn.linear_model import LinearRegression
+
             lr0 = LinearRegression().fit(X_train[W_train == 0, :p_half], Y_train[W_train == 0])
             mu0_preds[test_idx] = lr0.predict(X_test[:, :p_half])
             lr1 = LinearRegression().fit(X_train[W_train == 1, :p_half], Y_train[W_train == 1])
             mu1_preds[test_idx] = lr1.predict(X_test[:, :p_half])
         else:
-            lgbm0 = lgb.LGBMRegressor(**lgbm_params).fit(
-                X_train[W_train == 0], Y_train[W_train == 0],
-                sample_weight=weights_train[W_train == 0] if weights_train is not None else None)
-            mu0_preds[test_idx] = lgbm0.predict(X_test)
-            lgbm1 = lgb.LGBMRegressor(**lgbm_params).fit(
-                X_train[W_train == 1], Y_train[W_train == 1],
-                sample_weight=weights_train[W_train == 1] if weights_train is not None else None)
-            mu1_preds[test_idx] = lgbm1.predict(X_test)
-        
-        # Propensity score model
+            if learner == 'rf':
+                rf_params = dict(
+                    n_estimators=rf_trees,
+                    random_state=config.BASE_SEED,
+                    n_jobs=rf_jobs,
+                )
+                rf0 = RandomForestRegressor(**rf_params)
+                rf0.fit(
+                    X_train[W_train == 0],
+                    Y_train[W_train == 0],
+                    sample_weight=(weights_train[W_train == 0] if weights_train is not None else None),
+                )
+                mu0_preds[test_idx] = rf0.predict(X_test)
+
+                rf1 = RandomForestRegressor(**rf_params)
+                rf1.fit(
+                    X_train[W_train == 1],
+                    Y_train[W_train == 1],
+                    sample_weight=(weights_train[W_train == 1] if weights_train is not None else None),
+                )
+                mu1_preds[test_idx] = rf1.predict(X_test)
+            elif learner == 'lasso_cv':
+                scaler0 = StandardScaler()
+                x0 = X_train[W_train == 0]
+                scaler0.fit(x0)
+                model0 = LassoCV(
+                    cv=lasso_cv_folds,
+                    n_jobs=1,
+                    random_state=config.BASE_SEED,
+                    max_iter=lasso_cv_max_iter,
+                )
+                model0.fit(scaler0.transform(x0), Y_train[W_train == 0])
+                mu0_preds[test_idx] = model0.predict(scaler0.transform(X_test))
+
+                scaler1 = StandardScaler()
+                x1 = X_train[W_train == 1]
+                scaler1.fit(x1)
+                model1 = LassoCV(
+                    cv=lasso_cv_folds,
+                    n_jobs=1,
+                    random_state=config.BASE_SEED,
+                    max_iter=lasso_cv_max_iter,
+                )
+                model1.fit(scaler1.transform(x1), Y_train[W_train == 1])
+                mu1_preds[test_idx] = model1.predict(scaler1.transform(X_test))
+            else:
+                lgbm0 = lgb.LGBMRegressor(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    num_leaves=num_leaves,
+                    random_state=config.BASE_SEED,
+                    verbose=-1,
+                    n_jobs=1,
+                )
+                lgbm0.fit(
+                    X_train[W_train == 0],
+                    Y_train[W_train == 0],
+                    sample_weight=(weights_train[W_train == 0] if weights_train is not None else None),
+                )
+                mu0_preds[test_idx] = lgbm0.predict(X_test)
+
+                lgbm1 = lgb.LGBMRegressor(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    num_leaves=num_leaves,
+                    random_state=config.BASE_SEED,
+                    verbose=-1,
+                    n_jobs=1,
+                )
+                lgbm1.fit(
+                    X_train[W_train == 1],
+                    Y_train[W_train == 1],
+                    sample_weight=(weights_train[W_train == 1] if weights_train is not None else None),
+                )
+                mu1_preds[test_idx] = lgbm1.predict(X_test)
+
         if is_rct:
-            e_preds[test_idx] = pi_rct_val
+            e_preds[test_idx] = pi_rct_val if pi_rct_val is not None else np.mean(W_train)
         elif misspecification in ['correct_wrong', 'wrong_wrong']:
-            from sklearn.linear_model import LogisticRegression
-            lr_e = LogisticRegression(solver='liblinear').fit(X_train[:, :p_half], W_train)
+            lr_e = LogisticRegression(solver='liblinear', max_iter=1000).fit(X_train[:, :p_half], W_train)
             e_preds[test_idx] = lr_e.predict_proba(X_test[:, :p_half])[:, 1]
         else:
-            lgbm_e = lgb.LGBMClassifier(**lgbm_params).fit(X_train, W_train, sample_weight=weights_train)
-            e_preds[test_idx] = lgbm_e.predict_proba(X_test)[:, 1]
+            if learner == 'rf':
+                clf = RandomForestClassifier(
+                    n_estimators=rf_trees,
+                    random_state=config.BASE_SEED,
+                    n_jobs=rf_jobs,
+                )
+                clf.fit(X_train, W_train, sample_weight=weights_train)
+                e_preds[test_idx] = clf.predict_proba(X_test)[:, 1]
+            elif learner == 'lasso_cv':
+                scaler_e = StandardScaler().fit(X_train)
+                X_train_scaled = scaler_e.transform(X_train)
+                X_test_scaled = scaler_e.transform(X_test)
+                clf = LogisticRegressionCV(
+                    Cs=logit_cv_cs,
+                    cv=lasso_cv_folds,
+                    penalty='l1',
+                    solver='saga',
+                    scoring=logit_cv_scoring,
+                    max_iter=logit_cv_max_iter,
+                    random_state=config.BASE_SEED,
+                    n_jobs=1,
+                )
+                clf.fit(X_train_scaled, W_train, sample_weight=weights_train)
+                e_preds[test_idx] = clf.predict_proba(X_test_scaled)[:, 1]
+            else:
+                lgbmc = lgb.LGBMClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    num_leaves=num_leaves,
+                    random_state=config.BASE_SEED,
+                    verbose=-1,
+                    n_jobs=1,
+                )
+                lgbmc.fit(X_train, W_train, sample_weight=weights_train)
+                e_preds[test_idx] = lgbmc.predict_proba(X_test)[:, 1]
 
     e_preds = np.clip(e_preds, 0.01, 0.99)
     return mu0_preds, mu1_preds, e_preds
 
-def _get_hajek_ci(scores, q_j, N):
-    """
-    Calculates Hájek ATE estimator with sample variance-based (linearization) estimator.
-    
-    Implements Algorithm 1 from the latest OS-DML paper:
-    - Point estimation: τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
-    - Sample variance-based variance: 
-      Var(τ̂_HJ) = 1/(r*(Σ_t 1/q_{I_t})²) * (1/(r-1)) * Σ_t(U_t - Ū)²
-      where U_t = (φ̂_t - τ̂_HJ) / q_{I_t} and Ū = r^(-1) * Σ_t U_t
-    
-    Args:
-        scores: Pseudo-outcomes φ̂_{I_t} for each draw
-        q_j: Selection probabilities q_{I_t} for each draw
-        N: Population size (not used in the new formula)
-    
-    Returns:
-        Tuple of (est_ate, ci_lower, ci_upper)
-    """
-    r = len(scores)
+
+def _wald_ci_from_scores(scores: np.ndarray) -> Tuple[float, float, float]:
+    r = scores.shape[0]
     if r <= 1:
         return np.nan, np.nan, np.nan
-    
-    # Step 10: Hájek ATE estimator (ratio estimator)
-    # τ̂_HJ = (Σ_t φ̂_{I_t} / q_{I_t}) / (Σ_t 1 / q_{I_t})
-    numerator = np.sum(scores / q_j)
-    denominator = np.sum(1 / q_j)
-    est_ate = numerator / denominator
-    
-    # Step 12: Define residuals
-    # U_t = (φ̂_t - τ̂_HJ) / q_{I_t}
-    U_t = (scores - est_ate) / q_j
-    
-    # Ū = (r_0 + r_1)^(-1) * Σ_t U_t
-    U_bar = np.mean(U_t)
-    
-    # Step 13: Sample variance-based (linearization) estimator
-    # Var(τ̂_HJ) = 1/(r*(Σ_t 1/q_{I_t})²) * (1/(r-1)) * Σ_t(U_t - Ū)²
-    var_hat = (r / (denominator**2)) * (1.0 / (r - 1)) * np.sum((U_t - U_bar)**2)
-    
-    # Standard error and confidence interval
-    se = np.sqrt(var_hat) if var_hat >= 0 else np.nan
-    ci_lower = est_ate - 1.96 * se
-    ci_upper = est_ate + 1.96 * se
-    
-    return est_ate, ci_lower, ci_upper
+    est = float(np.mean(scores))
+    se = float(np.std(scores, ddof=1) / np.sqrt(r))
+    ci_lower = est - _CI_Z * se
+    ci_upper = est + _CI_Z * se
+    return est, ci_lower, ci_upper
 
 
-def _get_hansen_hurwitz_ci(scores, q_j, N):
-    """
-    Calculates design-based CI for the Hansen-Hurwitz estimator following Algorithm 1.
-    
-    This implements Steps 8-10 of Algorithm 1:
-    - Step 8: τ_HH = (1/(N*r)) * Σ_t (φ_{I_t} / q_{I_t})
-    - Step 9-10: Design-based variance with scaling factor 1/N²
-    
-    Args:
-        scores: Pseudo-outcomes φ_{I_t}
-        q_j: Selection probabilities for each draw
-        N: Population size
-    
-    Returns:
-        Tuple of (est_ate, ci_lower, ci_upper)
-    """
-    r = len(scores)
-    if r <= 1:
-        return np.nan, np.nan, np.nan
-    
-    # Step 8: Hansen-Hurwitz estimator
-    # τ_HH = (1/(N*r)) * Σ_t (φ_{I_t} / q_{I_t})
-    H_t = scores / q_j  # Scaled pseudo-outcomes
-    est_ate = np.mean(H_t) / N
-    
-    # Steps 9-10: Design-based variance
-    # Var(τ_HH) = (1/(N²*r)) * (1/(r-1)) * Σ_t(H_t - H̄)²
-    H_bar = np.mean(H_t)
-    var_hat = (1.0 / (N**2 * r)) * (1.0 / (r - 1)) * np.sum((H_t - H_bar)**2)
-    
-    se = np.sqrt(var_hat) if var_hat >= 0 else np.nan
-    ci_lower = est_ate - 1.96 * se
-    ci_upper = est_ate + 1.96 * se
-    
-    return est_ate, ci_lower, ci_upper
+# =============================================================================
+# UD-DML SUBSAMPLING PIPELINE
+# =============================================================================
 
 
-def _get_estimator_ci(scores, q_j, N, estimator_type='hajek'):
-    """
-    Wrapper function to choose between Hájek and Hansen-Hurwitz estimators.
-    
-    Args:
-        scores: Pseudo-outcomes φ_{I_t}
-        q_j: Selection probabilities for each draw
-        N: Population size
-        estimator_type: 'hajek' or 'hh'
-    
-    Returns:
-        Tuple of (est_ate, ci_lower, ci_upper)
-    """
-    if estimator_type.lower() == 'hajek':
-        return _get_hajek_ci(scores, q_j, N)
-    elif estimator_type.lower() == 'hh':
-        return _get_hansen_hurwitz_ci(scores, q_j, N)
-    else:
-        raise ValueError(f"Unknown estimator type: {estimator_type}. Use 'hajek' or 'hh'.")
+def _transform_covariates(X: np.ndarray) -> np.ndarray:
+    X_contig = np.ascontiguousarray(X, dtype=np.float64)
+    clip = getattr(config, 'UD_CDF_CLIP', 1e-6)
+    return _rank_transform_numba(X_contig, float(clip))
 
 
-def _get_full_data_ci(scores):
-    """
-    Calculates standard DML confidence interval using influence function variance.
-    
-    For full-data DML, we use the standard asymptotic variance formula based on
-    the sample variance of the pseudo-outcomes (influence functions).
-    
-    Args:
-        scores: Pseudo-outcomes φ_i for all n observations
-    
-    Returns:
-        Tuple of (est_ate, ci_lower, ci_upper)
-    """
-    n = len(scores)
-    est_ate = np.mean(scores)
-    se = np.std(scores, ddof=1) / np.sqrt(n)
-    ci_lower = est_ate - 1.96 * se
-    ci_upper = est_ate + 1.96 * se
-    return est_ate, ci_lower, ci_upper
+def _generate_uniform_design_points(n_points: int, dimension: int, rng: np.random.Generator) -> np.ndarray:
+    """Generate Latin-hypercube points in [0, 1]^p."""
+    if n_points <= 0:
+        raise ValueError("n_points must be positive for UD subsampling.")
+    points = np.empty((n_points, dimension), dtype=np.float64)
+    for d in range(dimension):
+        strata = (np.arange(n_points) + rng.random(n_points)) / n_points
+        rng.shuffle(strata)
+        points[:, d] = strata
+    clip = getattr(config, 'UD_CDF_CLIP', 1e-6)
+    return np.clip(points, clip, 1.0 - clip)
+
+
+def _query_available(tree: cKDTree, used: np.ndarray, point: np.ndarray, rng: np.random.Generator) -> int:
+    remaining = np.flatnonzero(~used)
+    if remaining.size == 0:
+        raise RuntimeError("No available units to match.")
+    k = 1
+    while True:
+        k = min(k, remaining.size)
+        try:
+            _, idx = tree.query(point, k=k, workers=-1)
+        except TypeError:
+            _, idx = tree.query(point, k=k)
+        idx = np.atleast_1d(idx)
+        for candidate in idx:
+            if not used[candidate]:
+                return int(candidate)
+        if k >= remaining.size:
+            break
+        k = min(remaining.size, k * 2)
+    return int(rng.choice(remaining))
+
+
+def _select_ud_indices(X: np.ndarray, W: np.ndarray, r_total: int, rng: np.random.Generator) -> np.ndarray:
+    if r_total <= 0:
+        raise ValueError("r_total must be positive for UD subsampling.")
+    if r_total > X.shape[0]:
+        raise ValueError("r_total cannot exceed population size in UD subsampling.")
+
+    treated_idx = np.where(W == 1)[0]
+    control_idx = np.where(W == 0)[0]
+    if treated_idx.size == 0 or control_idx.size == 0:
+        raise ValueError("UD subsampling requires both treated and control units.")
+
+    max_pairs = min(treated_idx.size, control_idx.size, r_total // 2)
+    if max_pairs == 0:
+        raise ValueError("Insufficient treated/control counts for UD subsampling.")
+
+    transformed = _transform_covariates(X)
+    treated_data = transformed[treated_idx]
+    control_data = transformed[control_idx]
+
+    treat_tree = cKDTree(treated_data)
+    control_tree = cKDTree(control_data)
+    used_treat = np.zeros(treated_idx.size, dtype=bool)
+    used_control = np.zeros(control_idx.size, dtype=bool)
+
+    skeleton = _generate_uniform_design_points(max_pairs, X.shape[1], rng)
+    selected_treat = []
+    selected_control = []
+
+    for point in skeleton:
+        t_local = _query_available(treat_tree, used_treat, point, rng)
+        c_local = _query_available(control_tree, used_control, point, rng)
+        used_treat[t_local] = True
+        used_control[c_local] = True
+        selected_treat.append(treated_idx[t_local])
+        selected_control.append(control_idx[c_local])
+
+    combined = np.concatenate([selected_treat, selected_control])
+    rng.shuffle(combined)
+    return combined
+
 
 # =============================================================================
 # MAIN METHOD IMPLEMENTATIONS
 # =============================================================================
 
+
 def run_full(X, W, Y_obs, pi_true, is_rct, k_folds, **kwargs):
-    """
-    FULL: Full-Data Double Machine Learning.
-    
-    Benchmark method that uses the entire dataset without subsampling.
-    This represents the gold standard that subsampling methods try to approximate.
-    Uses standard DML with cross-fitting and influence function-based inference.
-    
-    Args:
-        X: Covariates (N x p)
-        W: Treatment indicators (N,)
-        Y_obs: Observed outcomes (N,)
-        pi_true: True propensity scores (not used)
-        is_rct: Whether data comes from RCT
-        k_folds: Number of cross-fitting folds
-        **kwargs: Additional args including 'misspecification' (for robustness experiments)
-    
-    Returns:
-        Dict with keys: est_ate, ci_lower, ci_upper, runtime
-    """
     start_time = time.time()
     misspecification = kwargs.get('misspecification')
-    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
-    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
+    n_estimators_override = kwargs.get('n_estimators', getattr(config, 'LGBM_N_ESTIMATORS', None))
+    pi_value = float(pi_true) if np.isscalar(pi_true) else np.mean(pi_true) if pi_true is not None else np.mean(W)
+    learner = kwargs.get('learner', getattr(config, 'DEFAULT_NUISANCE_LEARNER', 'lgbm'))
+
     mu0, mu1, e = _fit_nuisance_models(
         X,
         W,
         Y_obs,
         k_folds,
         is_rct,
-        np.mean(W),
+        pi_value,
+        sample_weight=None,
         misspecification=misspecification,
         n_estimators=n_estimators_override,
+        learner=learner,
     )
     scores = _orthogonal_score(Y_obs, W, mu0, mu1, e)
-    est_ate, ci_lower, ci_upper = _get_full_data_ci(scores)
-    return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
-            "runtime": time.time() - start_time}
+    est_ate, ci_lower, ci_upper = _wald_ci_from_scores(scores)
+    return {
+        'est_ate': est_ate,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+        'runtime': time.time() - start_time,
+        'subsample_size': X.shape[0],
+        'subsample_unique': X.shape[0],
+        'learner': learner,
+    }
+
 
 def run_unif(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
-    """
-    Benchmark: Uniform Subsampling DML with Hansen-Hurwitz inference.
-    
-    This method draws r_total = r0 + r1 samples uniformly with replacement
-    and uses design-based inference.
-    """
     start_time = time.time()
-    N = len(Y_obs)
-    
-    # Handle both old format (r0, r1) and new format (r_total)
-    if 'r_total' in r:
-        r_total = r['r_total']
-    else:
-        r_total = r['r0'] + r['r1']
-    
-    misspecification = kwargs.get('misspecification')
+    if 'r_total' not in r:
+        raise ValueError("run_unif requires 'r_total' in the r dictionary.")
+    r_total = int(r['r_total'])
+    if r_total <= 0:
+        raise ValueError('r_total must be positive in run_unif.')
+    if r_total > X.shape[0]:
+        r_total = X.shape[0]
 
-    # Draw uniform subsample with replacement
-    sub_idx = np.random.choice(N, size=r_total, replace=True)
-    q_j = np.full(r_total, 1.0 / N)
-    
-    X_sub, W_sub, Y_sub = X[sub_idx], W[sub_idx], Y_obs[sub_idx]
-    
-    # Fit nuisance models with importance weights
-    weights = 1.0 / q_j
-    mu0, mu1, e = _fit_nuisance_models(
-        X_sub,
-        W_sub,
-        Y_sub,
-        k_folds,
-        is_rct,
-        np.mean(W_sub),
-        sample_weight=weights,
-        misspecification=misspecification,
-        n_estimators=n_estimators_override,
-    )
-    scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
-    
-    # Estimator and inference (Hájek or Hansen-Hurwitz)
-    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
-    return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
-            "runtime": time.time() - start_time}
-
-def _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, pps_type, **kwargs):
-    """
-    Two-phase optimal subsampling pipeline for OS-DML (Algorithm 1).
-    
-    Implements Algorithm 1 from the OS-DML paper.
-    Note: LSS now uses single-stage sampling (see run_lss function).
-    
-    Args:
-        X, W, Y_obs: Full population data
-        pi_true: True propensity scores (not used in OS-DML)
-        is_rct: Whether the data comes from RCT
-        r: Dictionary with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
-        k_folds: Number of folds for cross-fitting
-        pps_type: Should be 'OS' (kept for backward compatibility)
-        **kwargs: Additional arguments including 'misspecification'
-    
-    Returns:
-        Dictionary with est_ate, ci_lower, ci_upper, runtime
-    """
-    start_time = time.time()
-    N = len(Y_obs)
-    
-    misspecification = kwargs.get('misspecification')
-    delta = kwargs.get('delta', config.DELTA)
-    pilot_ratio = kwargs.get('pilot_ratio', config.DEFAULT_PILOT_RATIO)
-    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
-    
-    # Handle both old format (r0, r1) and new format (r_total)
-    if 'r_total' in r:
-        r_total = r['r_total']
-        r0 = max(1, int(round(r_total * pilot_ratio)))
-        r1 = max(1, r_total - r0)
-        if r0 + r1 != r_total:
-            r1 = r_total - r0
-    else:
-        r0, r1 = r['r0'], r['r1']
-        r_total = r0 + r1
-        pilot_ratio = r0 / r_total if r_total > 0 else pilot_ratio
-    
-    # =========================================================================
-    # PHASE 1: PILOT ESTIMATION AND PROBABILITY CONSTRUCTION (Algorithm 1, Steps 1-4)
-    # =========================================================================
-    
-    # Step 1: Draw uniform pilot subsample S_0 of size r_0 with replacement
-    pilot_idx = np.random.choice(N, size=r0, replace=True)
-    X_pilot, W_pilot, Y_pilot = X[pilot_idx], W[pilot_idx], Y_obs[pilot_idx]
-    
-    # Step 2: Fit cross-fitted nuisance models η^(0) on pilot data
-    lgbm_params_pilot = {
-        'n_jobs': 1,
-        'random_state': config.BASE_SEED,
-        'n_estimators': n_estimators_override,
-        'verbose': -1,
-        'feature_name': None,
-    }
-    
-    mu0_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
-        X_pilot[W_pilot == 0], Y_pilot[W_pilot == 0])
-    mu1_model = lgb.LGBMRegressor(**lgbm_params_pilot).fit(
-        X_pilot[W_pilot == 1], Y_pilot[W_pilot == 1])
-    
-    if is_rct:
-        e_model = lambda x: np.full(x.shape[0], np.mean(W_pilot))
-    else:
-        e_model_fit = lgb.LGBMClassifier(**lgbm_params_pilot).fit(X_pilot, W_pilot)
-        e_model = lambda x: e_model_fit.predict_proba(x)[:, 1]
-
-    # Steps 3-4: Compute estimated pseudo-outcomes for ALL i=1,...,N
-    mu0_full = mu0_model.predict(X)
-    mu1_full = mu1_model.predict(X)
-    e_full = np.clip(e_model(X), 0.01, 0.99)
-    
-    # φ_i^(0) = φ(Z_i; η^(0)) for all i
-    phi_pilot_full = _orthogonal_score(Y_obs, W, mu0_full, mu1_full, e_full)
-
-    # Algorithm 1, Step 4: Compute centered pseudo-outcomes and construct probabilities
-    # φ̂̄^(0) = N^(-1) * Σ_i φ̂_i^(0) (average over full data)
-    phi_bar_pilot = np.mean(phi_pilot_full)
-    
-    # Step 4: Set stabilized centered PPS probabilities
-    # p_i ∝ |φ̂_i^(0) - φ̂̄^(0)| + δ
-    centered_phi = phi_pilot_full - phi_bar_pilot
-    abs_centered_phi = np.abs(centered_phi)
-    numerator = abs_centered_phi + delta
-    pps_probs = numerator / np.sum(numerator)
-
-    # =========================================================================
-    # PHASE 2: MAIN SUBSAMPLING AND FINAL ESTIMATION (Algorithm 1, Steps 5-8)
-    # =========================================================================
-    
-    # Step 5: Draw main subsample S_1 of size r_1 using probabilities {p_i}
-    pps_idx = np.random.choice(N, size=r1, replace=True, p=pps_probs)
-
-    # Step 6: Form combined subsample S_comb = S_0 ∪ S_1
-    # Track which indices came from which phase for proper q_j assignment
-    combined_idx = np.concatenate([pilot_idx, pps_idx])
-    
-    # Per-draw selection probabilities:
-    # q_{I_t} = 1/N if from S_0 (uniform pilot)
-    # q_{I_t} = p_{I_t} if from S_1 (PPS main sample)
-    q_j = np.concatenate([
-        np.full(r0, 1.0 / N),      # Pilot draws: uniform probability 1/N
-        pps_probs[pps_idx]          # Main draws: PPS probabilities
-    ])
-    
-    X_c, W_c, Y_c = X[combined_idx], W[combined_idx], Y_obs[combined_idx]
-    
-    # Step 6 (continued): Fit final nuisance models with importance weights ω_t ∝ 1/q_{I_t}
-    weights = 1.0 / q_j
-    mu0, mu1, e = _fit_nuisance_models(
-        X_c,
-        W_c,
-        Y_c,
-        k_folds,
-        is_rct,
-        np.mean(W_c),
-        sample_weight=weights,
-        misspecification=misspecification,
-        n_estimators=n_estimators_override,
-    )
-    
-    # Step 7: Compute final estimated pseudo-outcomes
-    scores = _orthogonal_score(Y_c, W_c, mu0, mu1, e)
-    
-    # =========================================================================
-    # INFERENCE (Algorithm 1, Steps 8-10)
-    # =========================================================================
-    
-    # Steps 8-10: Calculate estimator and variance (Hájek or Hansen-Hurwitz)
-    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
-    
-    runtime = time.time() - start_time
-    return {
-        "est_ate": est_ate,
-        "ci_lower": ci_lower,
-        "ci_upper": ci_upper,
-        "runtime": runtime,
-        "pilot_ratio_used": pilot_ratio,
-        "r0": r0,
-        "r1": r1,
-        "r_total": r_total,
-        "delta_used": delta,
-    }
-
-def run_os(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
-    """
-    OS-DML: Optimal Subsampling for Double Machine Learning.
-    
-    Implements Algorithm 1 from the OS-DML paper. This is the main proposed method
-    that uses a two-stage procedure:
-    1. Pilot stage: Estimate nuisance functions on uniform subsample
-    2. Main stage: Draw probability-proportional-to-size sample based on |φ_i^(0)|
-    
-    Uses Hájek estimator with plug-in variance estimation by default.
-    
-    Args:
-        X: Covariates (N x p)
-        W: Treatment indicators (N,)
-        Y_obs: Observed outcomes (N,)
-        pi_true: True propensity scores (not used in OS-DML)
-        is_rct: Whether data comes from RCT
-        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
-        k_folds: Number of cross-fitting folds
-        **kwargs: Additional args including 'misspecification' (for robustness experiments)
-    
-    Returns:
-        Dict with keys: est_ate, ci_lower, ci_upper, runtime
-    """
-    return _run_pps_pipeline(X, W, Y_obs, pi_true, is_rct, r, k_folds, 'OS', **kwargs)
-
-def run_lss(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
-    """
-    LSS: Leverage Score Subsampling for DML (Single-Stage).
-    
-    Benchmark method that uses leverage scores for sampling probabilities.
-    Unlike OS-DML, this is a single-stage method that directly samples
-    based on statistical leverage scores without pilot estimation.
-    
-    Leverage scores: h_i = diagonal elements of H = X(X'X)^{-1}X'
-    Sampling probabilities: p_i ∝ h_i
-    
-    Args:
-        X: Covariates (N x p)
-        W: Treatment indicators (N,)
-        Y_obs: Observed outcomes (N,)
-        pi_true: True propensity scores (not used)
-        is_rct: Whether data comes from RCT
-        r: Dict with 'r0' (pilot size) and 'r1' (main subsample size) OR 'r_total' (total sample size)
-        k_folds: Number of cross-fitting folds
-        **kwargs: Additional args including 'misspecification'
-    
-    Returns:
-        Dict with keys: est_ate, ci_lower, ci_upper, runtime
-    """
-    start_time = time.time()
-    N = len(Y_obs)
-    
-    # Handle both old format (r0, r1) and new format (r_total)
-    if 'r_total' in r:
-        r_total = r['r_total']
-    else:
-        r_total = r['r0'] + r['r1']
-    
-    misspecification = kwargs.get('misspecification')
-    delta = kwargs.get('delta', config.DELTA)
-    n_estimators_override = kwargs.get('n_estimators', config.LGBM_N_ESTIMATORS)
-    
-    # =========================================================================
-    # SINGLE-STAGE LEVERAGE SCORE SAMPLING
-    # =========================================================================
-    
-    # Compute leverage scores from covariate matrix
-    X_aug = np.c_[np.ones(N), X]  # Add intercept
-    
-    try:
-        # Compute Q from QR decomposition (more stable than (X'X)^{-1})
-        Q, _ = np.linalg.qr(X_aug)
-        leverages = np.sum(Q**2, axis=1)  # h_i = ||Q_i||^2
-        
-        # Stabilize and normalize to get sampling probabilities
-        stabilized_leverages = leverages + delta
-        pps_probs = stabilized_leverages / np.sum(stabilized_leverages)
-        
-    except np.linalg.LinAlgError:
-        print("Warning: QR decomposition failed for LSS, falling back to uniform sampling")
-        pps_probs = np.full(N, 1.0 / N)
-    
-    # Draw single subsample based on leverage scores
-    subsample_idx = np.random.choice(N, size=r_total, replace=True, p=pps_probs)
-    q_j = pps_probs[subsample_idx]  # Selection probabilities for each draw
-    
-    # Extract subsampled data
+    sim_seed = kwargs.get('sim_seed', config.BASE_SEED)
+    rng = np.random.default_rng(sim_seed + 23)
+    subsample_idx = rng.choice(X.shape[0], size=r_total, replace=False)
     X_sub, W_sub, Y_sub = X[subsample_idx], W[subsample_idx], Y_obs[subsample_idx]
-    
-    # Fit nuisance models with importance weights
-    weights = 1.0 / q_j
+
+    misspecification = kwargs.get('misspecification')
+    n_estimators_override = kwargs.get('n_estimators', getattr(config, 'LGBM_N_ESTIMATORS', None))
+    pi_value = float(pi_true) if np.isscalar(pi_true) else np.mean(pi_true) if pi_true is not None else np.mean(W_sub)
+    learner = kwargs.get('learner', getattr(config, 'DEFAULT_NUISANCE_LEARNER', 'lgbm'))
+
     mu0, mu1, e = _fit_nuisance_models(
         X_sub,
         W_sub,
         Y_sub,
         k_folds,
         is_rct,
-        np.mean(W_sub),
-        sample_weight=weights,
+        pi_value,
+        sample_weight=None,
         misspecification=misspecification,
         n_estimators=n_estimators_override,
+        learner=learner,
     )
-    
-    # Compute pseudo-outcomes
     scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
-    
-    # Estimator and inference (Hájek or Hansen-Hurwitz)
-    est_ate, ci_lower, ci_upper = _get_estimator_ci(scores, q_j, N, config.ESTIMATOR_TYPE)
-    
-    runtime = time.time() - start_time
-    return {"est_ate": est_ate, "ci_lower": ci_lower, "ci_upper": ci_upper, 
-            "runtime": runtime}
+    est_ate, ci_lower, ci_upper = _wald_ci_from_scores(scores)
+    store_sample = kwargs.get('store_sample')
+    sample_payload = X_sub[:, :2].copy() if store_sample else None
+    return {
+        'est_ate': est_ate,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+        'runtime': time.time() - start_time,
+        'subsample_size': r_total,
+        'subsample_unique': r_total,
+        'learner': learner,
+        'subsample_projection': sample_payload,
+        'subsample_indices': subsample_idx.tolist(),
+    }
+
+
+def run_ud(X, W, Y_obs, pi_true, is_rct, r, k_folds, **kwargs):
+    start_time = time.time()
+    if 'r_total' not in r:
+        raise ValueError("run_ud requires 'r_total' in the r dictionary.")
+    r_total = int(r['r_total'])
+    if r_total <= 0:
+        raise ValueError('r_total must be positive for UD-DML.')
+    if r_total > X.shape[0]:
+        r_total = X.shape[0]
+
+    sim_seed = kwargs.get('sim_seed', config.BASE_SEED)
+    rng = np.random.default_rng(sim_seed + 31)
+    subsample_idx = _select_ud_indices(X, W, r_total, rng)
+    unique_count = int(np.unique(subsample_idx).size)
+
+    X_sub, W_sub, Y_sub = X[subsample_idx], W[subsample_idx], Y_obs[subsample_idx]
+
+    misspecification = kwargs.get('misspecification')
+    n_estimators_override = kwargs.get('n_estimators', getattr(config, 'LGBM_N_ESTIMATORS', None))
+    pi_value = float(pi_true) if np.isscalar(pi_true) else np.mean(pi_true) if pi_true is not None else np.mean(W_sub)
+    learner = kwargs.get('learner', getattr(config, 'DEFAULT_NUISANCE_LEARNER', 'lgbm'))
+
+    mu0, mu1, e = _fit_nuisance_models(
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        pi_value,
+        sample_weight=None,
+        misspecification=misspecification,
+        n_estimators=n_estimators_override,
+        learner=learner,
+    )
+    scores = _orthogonal_score(Y_sub, W_sub, mu0, mu1, e)
+    est_ate, ci_lower, ci_upper = _wald_ci_from_scores(scores)
+    store_sample = kwargs.get('store_sample')
+    sample_payload = X_sub[:, :2].copy() if store_sample else None
+    return {
+        'est_ate': est_ate,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+        'runtime': time.time() - start_time,
+        'subsample_size': len(subsample_idx),
+        'subsample_unique': unique_count,
+        'learner': learner,
+        'subsample_projection': sample_payload,
+        'subsample_indices': subsample_idx.tolist(),
+    }
+
