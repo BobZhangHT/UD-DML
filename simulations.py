@@ -132,6 +132,17 @@ def _generate_variant_blueprints(exp_name, exp_config):
             population_sizes = _trim_for_fast_demo(population_sizes)
             r_totals = _trim_for_fast_demo(r_totals)
         for population in population_sizes:
+            # FULL baseline (no subsample budget)
+            variant_full = base.copy()
+            variant_full.update(
+                {
+                    "label": f"N-{int(population)}_full",
+                    "population_size": int(population),
+                    "r_total": None,
+                    "method_whitelist": {"FULL"},
+                }
+            )
+            variants.append(_apply_fast_demo_overrides(variant_full))
             for r_total in r_totals:
                 variant = base.copy()
                 variant.update(
@@ -139,6 +150,7 @@ def _generate_variant_blueprints(exp_name, exp_config):
                         "label": f"N-{int(population)}_r-{int(r_total)}",
                         "population_size": int(population),
                         "r_total": int(r_total),
+                        "method_whitelist": {"UD", "UNIF"},
                     }
                 )
                 variants.append(_apply_fast_demo_overrides(variant))
@@ -257,7 +269,7 @@ def run_single_replication(task):
 
         if isinstance(metadata.get("store_sample"), bool) and metadata["store_sample"] and method_name in ("UD", "UNIF"):
             cov_key = metadata["covariates"]
-            dims_map = {"x1": (0, 1), "x2": (0, 5), "x3": (0, 1)}
+            dims_map = {"x1": (0, 1), "x2": (0, 5), "x3": (0, 5)}
             dims = dims_map.get(cov_key, (0, 1))
             dims = tuple(int(d) for d in dims)
             full_proj = data["X"][:, list(dims)].astype(np.float32, copy=False)
@@ -380,6 +392,11 @@ def run_experiment(exp_name, n_jobs=-1):
     for scenario_name in exp_config["scenarios"]:
         for method_name in exp_config["methods"]:
             for variant in variants:
+                allowed_methods = variant.get("method_whitelist")
+                if allowed_methods and method_name not in allowed_methods:
+                    continue
+                variant_for_method = variant.copy()
+                variant_for_method.pop("method_whitelist", None)
                 n_replications = variant.get("n_replications", config.DEFAULT_REPLICATIONS)
                 for sim_id in range(n_replications):
                     all_tasks.append(
@@ -388,7 +405,7 @@ def run_experiment(exp_name, n_jobs=-1):
                             scenario_name,
                             method_name,
                             sim_id,
-                            variant.copy(),
+                            variant_for_method,
                             checkpoint_dir,
                         )
                     )

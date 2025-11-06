@@ -117,7 +117,6 @@ def _fit_nuisance_models(
     max_depth = getattr(config, 'LGBM_MAX_DEPTH', 5)
     learning_rate = getattr(config, 'LGBM_LEARNING_RATE', 0.1)
     num_leaves = getattr(config, 'LGBM_NUM_LEAVES', 31)
-    p_half = X.shape[1] // 2
     learner = (learner or getattr(config, 'DEFAULT_NUISANCE_LEARNER', 'lgbm')).lower()
     if learner in ('lasso', 'lassocv'):
         learner = 'lasso_cv'
@@ -137,10 +136,11 @@ def _fit_nuisance_models(
         if misspecification in ['wrong_correct', 'wrong_wrong']:
             from sklearn.linear_model import LinearRegression
 
-            lr0 = LinearRegression().fit(X_train[W_train == 0, :p_half], Y_train[W_train == 0])
-            mu0_preds[test_idx] = lr0.predict(X_test[:, :p_half])
-            lr1 = LinearRegression().fit(X_train[W_train == 1, :p_half], Y_train[W_train == 1])
-            mu1_preds[test_idx] = lr1.predict(X_test[:, :p_half])
+            # Use only X1 and X2 (first 2 features) for misspecified outcome models
+            lr0 = LinearRegression().fit(X_train[W_train == 0, :2], Y_train[W_train == 0])
+            mu0_preds[test_idx] = lr0.predict(X_test[:, :2])
+            lr1 = LinearRegression().fit(X_train[W_train == 1, :2], Y_train[W_train == 1])
+            mu1_preds[test_idx] = lr1.predict(X_test[:, :2])
         else:
             if learner == 'rf':
                 rf_params = dict(
@@ -223,8 +223,9 @@ def _fit_nuisance_models(
         if is_rct:
             e_preds[test_idx] = pi_rct_val if pi_rct_val is not None else np.mean(W_train)
         elif misspecification in ['correct_wrong', 'wrong_wrong']:
-            lr_e = LogisticRegression(solver='liblinear', max_iter=1000).fit(X_train[:, :p_half], W_train)
-            e_preds[test_idx] = lr_e.predict_proba(X_test[:, :p_half])[:, 1]
+            # Use only X1 and X2 (first 2 features) for misspecified propensity score model
+            lr_e = LogisticRegression(solver='liblinear', max_iter=1000).fit(X_train[:, :2], W_train)
+            e_preds[test_idx] = lr_e.predict_proba(X_test[:, :2])[:, 1]
         else:
             if learner == 'rf':
                 clf = RandomForestClassifier(

@@ -1,9 +1,10 @@
-# OS-DML: Optimal Subsampling for Double Machine Learning
+# UD-DML: Uniform Design Double Machine Learning
 # Requirements for running simulations and analysis
 
 # Core scientific computing
 numpy>=1.21.0
 scipy>=1.7.0
+numba>=0.56.0
 
 # Machine learning
 lightgbm>=3.3.0
@@ -16,17 +17,11 @@ pandas>=1.3.0
 joblib>=1.1.0
 tqdm>=4.62.0
 
-# Jupyter notebook support (optional, for interactive use)
-jupyter>=1.0.0
-notebook>=6.4.0
-ipywidgets>=7.6.0
-
-# Plotting (optional, for visualization)
+# Visualization
 matplotlib>=3.4.0
-seaborn>=0.11.0
 
-# Hyperparameter optimization (for hyperparameter_tuning.py)
-optuna>=3.0.0
-plotly>=5.0.0
-kaleido>=0.2.0
+# Optional: Jupyter notebook support for interactive use
+# jupyter>=1.0.0
+# notebook>=6.4.0
+# ipywidgets>=7.6.0
 

@@ -40,7 +40,7 @@ LGBM_MAX_DEPTH = 5  # Maximum depth of trees
 LGBM_LEARNING_RATE = 0.1  # Learning rate for gradient boosting
 LGBM_NUM_LEAVES = 31  # Number of leaves in each tree
 DEFAULT_NUISANCE_LEARNER = 'lgbm'
-RF_N_TREES = 200
+RF_N_TREES = 100
 RF_N_JOBS = 1
 LASSO_CV_FOLDS = 5
 LASSO_CV_MAX_ITER = 5000
@@ -52,7 +52,7 @@ LOGIT_CV_CS = np.logspace(-2, 2, 5)
 # 1.2 GLOBAL GRIDS
 # =============================================================================
 SUBSAMPLE_TOTALS = [1000, 2_500, 5_000, 7_500, 10_000]
-POPULATION_SIZE_GRID = [100_000, 500_000, 1_000_000]
+POPULATION_SIZE_GRID = [100_000, 500_000]
 ROBUSTNESS_MISSPECIFICATIONS = [
     'correct_correct',
     'correct_wrong',
@@ -109,6 +109,7 @@ def get_experiments():
     all_methods = {
         'UD': {'func': methods.run_ud},
         'UNIF': {'func': methods.run_unif},
+        'FULL': {'func': methods.run_full, 'params': {'k_folds': K_FOLDS}},
     }
 
     experiments = {
@@ -144,11 +145,11 @@ def get_experiments():
                 'Effect of full-data size on estimation accuracy for low/high UD budgets.'
             ),
             'scenarios': list(scenarios.keys()),
-            'methods': ['UD', 'UNIF'],
+            'methods': ['UD', 'UNIF', 'FULL'],
             'base_dir': './simulation_results/population_scaling',
             'params': {
                 'population_sizes': POPULATION_SIZE_GRID,
-                'r_totals': [2_000, 10_000],
+                'r_totals': [1_000, 5_000],
                 'n_estimators': LGBM_N_ESTIMATORS,
                 'k_folds': K_FOLDS,
                 'n_replications': DEFAULT_REPLICATIONS,
