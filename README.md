@@ -3,28 +3,18 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Implementation of the simulation suite described in **UD_DML.pdf**. The repository focuses on
-uniform-design subsampling paired with double/debiased machine learning, benchmarking the proposed
-UD-DML estimator against uniform subsampling (UNIF-DML) across controlled randomised trials and
-observational study designs.
+A Python implementation of Uniform Design Double Machine Learning (UD-DML) for efficient causal inference on large datasets. This repository reproduces the simulation studies from **UD_DML.pdf**.
 
 ---
 
-## Overview
+## What is UD-DML?
 
-UD-DML first constructs a space-filling subsample in the covariate domain, then runs cross-fitted
-Neyman-orthogonal scores on the selected points. In this code base:
+UD-DML estimates average treatment effects (ATE) when working with massive datasets. It works in two steps:
 
-- Covariates are generated from three canonical designs (independent uniform, mixed marginals,
-  correlated block) with dimensionality fixed at **p = 10**.
-- Average treatment effects are estimated with K-fold cross-fitting using nuisance models. The default
-  learner is **LightGBM**, with **LassoCV** and **Random Forest** available as alternatives.
-- Subsampling weights employ stratified Latin-hypercube draws with fast `cKDTree` lookup and JIT-compiled
-  transformations via **Numba** for efficiency.
-- Five experiment families reproduce the analyses in the paper: visualisation, subsample-size grids,
-  population-size scaling, double-robustness checks, and nuisance-learner sensitivity. Each experiment
-  also writes publication-ready CSV/LaTeX summaries (for example `population_size_publication_table.*`
-  and `double_robust_publication_table.*`) alongside plots.
+1. **Subsampling**: Selects a space-filling subsample using uniform design (Latin-hypercube points with nearest-neighbor matching)
+2. **Estimation**: Applies cross-fitted double machine learning on the subsample
+
+The method is compared against uniform random subsampling (UNIF-DML) and full-data DML (FULL-DML).
 
 ---
 
@@ -34,23 +24,21 @@ Neyman-orthogonal scores on the selected points. In this code base:
 pip install -r requirements.txt
 ```
 
-The main dependencies are `numpy`, `scipy`, `numba`, `scikit-learn`, `lightgbm`, `pandas`, `joblib`,
-`tqdm`, and `matplotlib`.
+**Key dependencies**: numpy, scipy, numba, scikit-learn, lightgbm, pandas, joblib, tqdm, matplotlib
 
 ---
 
 ## Quick Start
 
 ```python
-import numpy as np
 from data_generation import generate_obs_1_data
 from methods import run_ud, run_unif
 import config
 
-# Generate a synthetic observational dataset (p = 10 by default)
+# Generate synthetic data (10 covariates, 100k observations)
 data = generate_obs_1_data(n=100_000, p=10)
 
-# UD-DML estimate with a subsample of 5,000 points
+# UD-DML estimate with 5,000 subsample points
 ud_result = run_ud(
     data["X"], data["W"], data["Y_obs"], data["pi_true"],
     is_rct=False,
@@ -58,7 +46,7 @@ ud_result = run_ud(
     k_folds=config.K_FOLDS,
 )
 
-# Uniform subsampling baseline (same r_total)
+# Uniform subsampling baseline
 unif_result = run_unif(
     data["X"], data["W"], data["Y_obs"], data["pi_true"],
     is_rct=False,
@@ -70,90 +58,82 @@ print("UD-DML ATE:", ud_result["est_ate"])
 print("UNIF ATE:", unif_result["est_ate"])
 ```
 
-Both estimators return point estimates, Wald-style 95% confidence intervals, runtime, and the actual
-subsample size used.
+Each estimator returns: point estimate, 95% confidence interval, runtime, and actual subsample size.
 
 ---
 
-## Simulation Experiments
+## Data Scenarios
 
-All experiments are orchestrated by **`simulations.py`**. Every run checkpoints individual Monte
-Carlo replications under `simulation_results/` and writes processed tables/figures to
-`analysis_results/`.
+The codebase includes **6 scenarios** (3 RCT + 3 Observational):
+
+- **RCT-1, OBS-1**: Simple linear models, high overlap
+- **RCT-2, OBS-2**: Moderate non-linearity, moderate overlap  
+- **RCT-3, OBS-3**: Complex non-linear models, low overlap
+
+All scenarios use **10 covariates** (`p=10`) with different distributions:
+- **X1**: Independent uniform
+- **X2**: Mixed marginals (uniform + normal)
+- **X3**: Gaussian mixture + standard normal
+
+---
+
+## Running Experiments
+
+Run all experiments:
 
 ```bash
-# Run the full catalogue with automatic core detection
 python simulations.py
-
-# Fast smoke test (10 replications, trimmed grids)
-python simulations.py --fast-demo --jobs 1
-
-# Select a subset of experiments
-python simulations.py --experiments experiment_population_size experiment_double_robust --jobs 4
 ```
 
-### Experiment catalogue
+Run specific experiments:
 
-1. **`experiment_visualization`** – draws 2D projections of UD vs. UNIF subsamples for every DGP.
-2. **`experiment_subsample_size`** – compares UD and UNIF across `r_total` in
-   {1k, 2.5k, 5k, 7.5k, 10k} for all six scenarios.
-3. **`experiment_population_size`** – studies scalability over population sizes
-   {100k, 500k} at low/high subsample budgets, benchmarking UD, UNIF, and the FULL-data estimator.
-4. **`experiment_double_robust`** – checks the four nuisance specifications
-   (correct/correct → wrong/wrong) on observational scenarios, with UD/UNIF outputs and boxplots.
-5. **`experiment_nuisance_sensitivity`** – benchmarks UD/UNIF with alternative nuisance learners
-   (`lasso_cv`, random forest, LightGBM) on the most challenging DGP (OBS-3).
+```bash
+python simulations.py --experiments experiment_subsample_size experiment_population_size --jobs 4
+```
 
-Each experiment description, method list, output directory, and parameter grid is declared in
-`config.get_experiments()`.
+Quick test (fewer replications):
 
-### Outputs & reporting
+```bash
+python simulations.py --fast-demo --jobs 1
+```
 
-For every experiment the driver writes:
+### Available Experiments
 
-- Raw replication checkpoints under `simulation_results/<experiment>/checkpoints/`.
-- Aggregated plots to `analysis_results/<short_name>/figures/` (where `<short_name>` is the experiment
-  name without the `experiment_` prefix, e.g., `visualization`, `population_size`).
-- Publication-ready tables (CSV + LaTeX) to `analysis_results/<short_name>/tables/`, e.g.:
-  - `population_size_publication_table.csv/.tex` – Scenario × Population × Subsample with RMSE / CI coverage / CI width / runtime blocks (UD, UNIF, FULL).
-  - `double_robust_publication_table.csv/.tex` – OBS scenarios with outcome/propensity misspecification grids for UD vs. UNIF.
+1. **`experiment_visualization`** - Visual comparison of UD vs UNIF subsamples
+2. **`experiment_subsample_size`** - Performance across subsample sizes {1k, 2.5k, 5k, 7.5k, 10k}
+3. **`experiment_population_size`** - Scalability with population sizes {100k, 500k}
+4. **`experiment_double_robust`** - Double-robustness tests with misspecified models
+5. **`experiment_nuisance_sensitivity`** - Comparison across learners (LightGBM, Lasso, Random Forest)
 
-Figures are rendered with matplotlib in `Agg` mode, so no GUI backend is required.
+### Output Files
+
+Results are saved to:
+- **Raw data**: `simulation_results/<experiment>/checkpoints/`
+- **Plots**: `analysis_results/<experiment>/figures/`
+- **Tables**: `analysis_results/<experiment>/tables/` (CSV and LaTeX formats)
 
 ---
 
-## Configuration Highlights
+## Configuration
 
-`config.py` centralises global settings:
+Edit `config.py` to adjust settings:
 
 ```python
+# Simulation parameters
 BASE_SEED = 20250919
 DEFAULT_REPLICATIONS = 500
 N_POPULATION = 500_000
 K_FOLDS = 2
 
-# Nuisance learners
-DEFAULT_NUISANCE_LEARNER = 'lgbm'  # default: LightGBM
+# Nuisance learners (default: LightGBM)
+DEFAULT_NUISANCE_LEARNER = 'lgbm'
 LGBM_N_ESTIMATORS = 100
 LGBM_MAX_DEPTH = 5
-LASSO_CV_FOLDS = 5
-LASSO_CV_MAX_ITER = 5000
-RF_N_JOBS = 1  # keep tree models single-threaded inside outer parallel loops
 
-# Subsample grids
+# Subsample sizes
 SUBSAMPLE_TOTALS = [1_000, 2_500, 5_000, 7_500, 10_000]
 POPULATION_SIZE_GRID = [100_000, 500_000]
 ```
-
-All six scenarios now pass `p=10` into the data generators. Adjust `SUBSAMPLE_TOTALS`,
-`POPULATION_SIZE_GRID`, and experiment-specific dictionaries to explore different budgets or
-population scales.
-
-Parallel execution is controlled via:
-
-- `config.MAX_PARALLEL_JOBS` – default upper bound on outer parallelism.
-- `OS_DML_MAX_JOBS` – environment override evaluated at runtime.
-- `RF_N_JOBS = 1` – tree-based nuisance learners remain single-threaded to avoid oversubscription.
 
 ---
 
@@ -161,25 +141,23 @@ Parallel execution is controlled via:
 
 ```
 UD-DML/
-├── config.py             # Global configuration & experiment catalogue
-├── data_generation.py    # DGP definitions (p = 10)
-├── evaluation.py         # Post-processing, tables, and figures
-├── methods.py            # UD-DML and UNIF estimators
-├── simulations.py        # Unified driver for all experiments
+├── config.py             # Configuration and experiment definitions
+├── data_generation.py    # Data-generating processes (6 scenarios)
+├── methods.py            # UD-DML, UNIF-DML, and FULL-DML estimators
+├── evaluation.py         # Post-processing and visualization
+├── simulations.py        # Main experiment driver
 ├── requirements.txt
-├── README.md
-├── simulation_results/   # Raw outputs (created at runtime)
-└── analysis_results/     # Aggregated tables/plots (created at runtime)
+└── README.md
 ```
 
 ---
 
 ## Citation
 
-If you use this codebase, please cite the accompanying UD-DML manuscript when available.
+If you use this code, please cite the UD-DML manuscript.
 
 ---
 
 ## License
 
-Released under the [MIT License](LICENSE).
+MIT License
