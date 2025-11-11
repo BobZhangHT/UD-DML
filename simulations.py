@@ -281,7 +281,7 @@ def run_single_replication(task):
         if (
             isinstance(metadata.get("store_sample"), bool)
             and metadata["store_sample"]
-            and method_name == "UD"
+            and method_name in ("UD", "UNIF")
             and metadata.get("scenario", "").startswith("OBS")
         ):
             result["propensity_full"] = np.asarray(data["pi_true"], dtype=np.float32)

@@ -159,6 +159,16 @@ def _get_method_marker(method: str, learner: str | None = None) -> str:
     return METHOD_DEFAULT_MARKERS.get(method, "o")
 
 
+def _format_learner_name(learner: str) -> str:
+    """Format learner name for display (uppercase)."""
+    learner_display = {
+        "lasso_cv": "LASSO_CV",
+        "lgbm": "LGBM",
+        "rf": "RF",
+    }
+    return learner_display.get(learner, learner.upper())
+
+
 def _methods_present(df: pd.DataFrame, allowed: Iterable[str] | None = None) -> List[str]:
     present = []
     if df.empty or "method" not in df.columns:
@@ -325,12 +335,77 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
 
     obs_order = [sc for sc in ["OBS-1", "OBS-2", "OBS-3"] if sc in obs_propensity]
     if obs_order:
-        fig, axes = plt.subplots(1, len(obs_order), figsize=(6 * len(obs_order), 4), sharey=True)
+        # Collect subsample propensity scores for UD and UNIF methods
+        # Use a single replication (sim_id) for consistency across methods
+        ud_propensity: Dict[str, np.ndarray] = {}
+        ud_treatment: Dict[str, np.ndarray] = {}
+        unif_propensity: Dict[str, np.ndarray] = {}
+        unif_treatment: Dict[str, np.ndarray] = {}
+        
+        # Find a common sim_id for each scenario that exists for both UD and UNIF methods
+        scenario_to_sim_id: Dict[str, int] = {}
+        for scenario_name in obs_order:
+            # Find sim_ids that exist for both UD and UNIF methods
+            ud_sim_ids = set()
+            unif_sim_ids = set()
+            for res in raw_results:
+                if res.get("scenario") == scenario_name and res.get("sim_id") is not None:
+                    method = res.get("method")
+                    sim_id = res.get("sim_id")
+                    if method == "UD":
+                        ud_sim_ids.add(sim_id)
+                    elif method == "UNIF":
+                        unif_sim_ids.add(sim_id)
+            # Find common sim_id
+            common_sim_ids = ud_sim_ids & unif_sim_ids
+            if common_sim_ids:
+                scenario_to_sim_id[scenario_name] = min(common_sim_ids)  # Use smallest sim_id
+        
+        for res in raw_results:
+            method = res.get("method")
+            scenario_name = res.get("scenario")
+            sim_id = res.get("sim_id")
+            
+            if scenario_name not in obs_order:
+                continue
+            
+            # Use the same sim_id for consistency
+            if sim_id != scenario_to_sim_id.get(scenario_name):
+                continue
+            
+            prop_full = res.get("propensity_full")
+            treat_full = res.get("treatment_full")
+            subsample_indices = res.get("subsample_indices")
+            
+            if prop_full is not None and treat_full is not None and subsample_indices is not None:
+                prop_full_arr = np.asarray(prop_full)
+                treat_full_arr = np.asarray(treat_full).astype(bool)
+                subsample_idx = np.asarray(subsample_indices)
+                
+                # Extract subsample propensity scores and treatment
+                prop_subsample = prop_full_arr[subsample_idx]
+                treat_subsample = treat_full_arr[subsample_idx]
+                
+                if method == "UD":
+                    if scenario_name not in ud_propensity:
+                        ud_propensity[scenario_name] = prop_subsample
+                        ud_treatment[scenario_name] = treat_subsample
+                elif method == "UNIF":
+                    if scenario_name not in unif_propensity:
+                        unif_propensity[scenario_name] = prop_subsample
+                        unif_treatment[scenario_name] = treat_subsample
+        
+        # Create 3x3 subplot grid
+        fig, axes = plt.subplots(3, len(obs_order), figsize=(6 * len(obs_order), 12), sharey="row", sharex=True)
         if len(obs_order) == 1:
-            axes = [axes]
+            axes = np.expand_dims(axes, axis=1)
+        
         colors = {"Treatment": "#d62728", "Control": "#1f77b4"}
         bins = np.linspace(0.0, 1.0, 60)
-        for ax, scenario in zip(axes, obs_order):
+        
+        # Row 1: Full data
+        for col, scenario in enumerate(obs_order):
+            ax = axes[0, col]
             prop = obs_propensity[scenario]
             treat = obs_treatment[scenario].astype(bool)
             ax.hist(
@@ -339,7 +414,7 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
                 density=True,
                 alpha=0.6,
                 color=colors["Treatment"],
-                label="Treatment",
+                label="Treatment" if col == 0 else None,
             )
             ax.hist(
                 prop[~treat],
@@ -347,18 +422,71 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
                 density=True,
                 alpha=0.6,
                 color=colors["Control"],
-                label="Control",
+                label="Control" if col == 0 else None,
             )
-            ax.set_title(f"{scenario}")
-            ax.set_xlabel("Propensity score")
+            ax.set_title(f"Full Data: {scenario}")
+            if col == 0:
+                ax.set_ylabel("Density")
             ax.grid(True, ls="--", alpha=0.3)
-        axes[0].set_ylabel("Density")
+        
+        # Row 2: UD-DML
+        for col, scenario in enumerate(obs_order):
+            ax = axes[1, col]
+            if scenario in ud_propensity:
+                prop = ud_propensity[scenario]
+                treat = ud_treatment[scenario].astype(bool)
+                ax.hist(
+                    prop[treat],
+                    bins=bins,
+                    density=True,
+                    alpha=0.6,
+                    color=colors["Treatment"],
+                )
+                ax.hist(
+                    prop[~treat],
+                    bins=bins,
+                    density=True,
+                    alpha=0.6,
+                    color=colors["Control"],
+                )
+            ax.set_title(f"UD-DML: {scenario}")
+            if col == 0:
+                ax.set_ylabel("Density")
+            ax.grid(True, ls="--", alpha=0.3)
+        
+        # Row 3: UNIF-DML
+        for col, scenario in enumerate(obs_order):
+            ax = axes[2, col]
+            if scenario in unif_propensity:
+                prop = unif_propensity[scenario]
+                treat = unif_treatment[scenario].astype(bool)
+                ax.hist(
+                    prop[treat],
+                    bins=bins,
+                    density=True,
+                    alpha=0.6,
+                    color=colors["Treatment"],
+                )
+                ax.hist(
+                    prop[~treat],
+                    bins=bins,
+                    density=True,
+                    alpha=0.6,
+                    color=colors["Control"],
+                )
+            ax.set_title(f"UNIF-DML: {scenario}")
+            ax.set_xlabel("Propensity score")
+            if col == 0:
+                ax.set_ylabel("Density")
+            ax.grid(True, ls="--", alpha=0.3)
+        
+        # Add legend to the first subplot
         handles = [
             Line2D([0], [0], color=colors["Treatment"], lw=6, label="Treatment"),
             Line2D([0], [0], color=colors["Control"], lw=6, label="Control"),
         ]
-        fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.05), ncol=2, frameon=False)
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        axes[0, 0].legend(handles=handles, loc="upper right", frameon=False)
+        fig.tight_layout()
         _save_figure_multi_format(fig, figures_dir / "visualization_propensity_density")
 def _subsample_size_reports(df: pd.DataFrame, analysis_dir: Path):
     tables_dir, figures_dir = _ensure_directories(analysis_dir)
@@ -383,38 +511,69 @@ def _subsample_size_reports(df: pd.DataFrame, analysis_dir: Path):
         scen_df = summary[summary["scenario"] == scenario]
         for col, (metric, title) in enumerate(metrics):
             ax = axes[row, col]
-            for method in methods_present:
-                color = METHOD_COLORS[method]
-                method_df = scen_df[scen_df["method"] == method].sort_values("r_total")
-                if method_df.empty:
-                    continue
-                ax.plot(
-                    method_df["r_total"],
-                    method_df[metric],
-                    marker=_get_method_marker(method),
-                    color=color,
-                    label=method if row == 0 else None,
-                )
-            ax.set_xscale("log")
-            ax.set_xlabel("r_total")
-            if col == 0:
-                ax.set_ylabel(scenario)
-            ax.set_title(title)
-            ax.grid(True, ls="--", alpha=0.3)
             if metric == "CI_Coverage":
+                r_values = sorted(scen_df["r_total"].dropna().unique())
+                if not r_values:
+                    continue
+                x = np.arange(len(r_values))
+                bar_width = 0.8 / max(1, len(methods_present))
+                for idx, method in enumerate(methods_present):
+                    color = METHOD_COLORS[method]
+                    method_df = scen_df[scen_df["method"] == method]
+                    if method_df.empty:
+                        continue
+                    heights = []
+                    for r_val in r_values:
+                        value_series = method_df[method_df["r_total"] == r_val][metric]
+                        heights.append(float(value_series.iloc[0]) if not value_series.empty else np.nan)
+                    position_shift = (idx - (len(methods_present) - 1) / 2) * bar_width
+                    ax.bar(
+                        x + position_shift,
+                        heights,
+                        bar_width,
+                        color=color,
+                        edgecolor="black",
+                        linewidth=0.5,
+                        label=method if row == 0 else None,
+                    )
+                ax.set_xticks(x)
+                ax.set_xticklabels([f"{int(r)}" for r in r_values])
+                ax.set_xlabel("$r$")
+                if col == 0:
+                    ax.set_ylabel(scenario)
+                ax.set_title(title)
+                ax.grid(True, ls="--", alpha=0.3)
                 ax.axhline(0.95, ls=":", color="gray", alpha=0.7)
+            else:
+                for method in methods_present:
+                    color = METHOD_COLORS[method]
+                    method_df = scen_df[scen_df["method"] == method].sort_values("r_total")
+                    if method_df.empty:
+                        continue
+                    ax.plot(
+                        method_df["r_total"],
+                        method_df[metric],
+                        marker=_get_method_marker(method),
+                        color=color,
+                        label=method if row == 0 else None,
+                    )
+                ax.set_xscale("log")
+                ax.set_xlabel("$r$")
+                if col == 0:
+                    ax.set_ylabel(scenario)
+                ax.set_title(title)
+                ax.grid(True, ls="--", alpha=0.3)
+    # Add legend to the first subplot (top-left)
     handles = [
         Line2D([0], [0], color=METHOD_COLORS[method], marker=_get_method_marker(method), label=method)
         for method in methods_present
     ]
-    fig.legend(
+    axes[0, 0].legend(
         handles=handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.98),
-        ncol=max(1, len(handles)),
+        loc="upper right",
         frameon=False,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.tight_layout()
     _save_figure_multi_format(fig, figures_dir / "subsample_size_metrics")
 
 
@@ -1013,7 +1172,7 @@ def _nuisance_sensitivity_reports(
                                     
                                     # Add to legend (only for first metric)
                                     if ax_idx == 0 and r_idx == 0:
-                                        legend_labels.append(f"{method}-{learner}")
+                                        legend_labels.append(f"{method}-{_format_learner_name(learner)}")
                             
                             current_pos += 1
                     
@@ -1133,7 +1292,7 @@ def _nuisance_sensitivity_reports(
                         if ax_idx == 0:
                             if combination_idx == 0:
                                 legend_labels = []
-                            legend_labels.append(f"{method}-{learner}")
+                            legend_labels.append(f"{method}-{_format_learner_name(learner)}")
                         
                         combination_idx += 1
             
@@ -1172,7 +1331,7 @@ def _nuisance_sensitivity_reports(
                     edgecolor='black',
                     hatch=hatch,
                     alpha=0.7,
-                    label=f"{method}-{learner}"
+                    label=f"{method}-{_format_learner_name(learner)}"
                 )
                 legend_handles.append(patch)
         
