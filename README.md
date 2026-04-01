@@ -1,20 +1,28 @@
-﻿# UD-DML: Uniform Design Double Machine Learning
+# UD-DML: Uniform Design Double Machine Learning
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Python implementation of Uniform Design Double Machine Learning (UD-DML) for efficient causal inference on large datasets. This repository reproduces the simulation studies from **UD_DML.pdf**.
+A Python implementation of **Uniform Design Double Machine Learning (UD-DML)** for scalable causal inference on massive datasets.
+
+> **Reference:** Qu, Xu & Zhang (2026). *UD-DML: Uniform Design Subsampling for Double Machine Learning over Massive Data.*
 
 ---
 
 ## What is UD-DML?
 
-UD-DML estimates average treatment effects (ATE) when working with massive datasets. It works in two steps:
+UD-DML estimates the **Average Treatment Effect (ATE)** when working with massive observational datasets where full-data DML is computationally prohibitive. It works in three phases:
 
-1. **Subsampling**: Selects a space-filling subsample using uniform design (Latin-hypercube points with nearest-neighbor matching)
-2. **Estimation**: Applies cross-fitted double machine learning on the subsample
+1. **Phase 1 — UD Subsampling in PCA-Rotated Space**
+   - Standardise covariates and perform PCA to retain the dominant *q* dimensions (ρ₀ = 0.85 cumulative variance threshold).
+   - Construct a low-discrepancy skeleton in [0,1]^q via the **good lattice point (GLP)** method with power generators, selecting the design that minimises the **mixture discrepancy** D²_M.
+   - Map the skeleton to covariate space through marginal empirical inverse CDFs.
+   - Find the nearest available **treated and control unit** for each skeleton point (paired matching without replacement) using `cKDTree` spatial indices.
 
-The method is compared against uniform random subsampling (UNIF-DML) and full-data DML (FULL-DML).
+2. **Phase 2 — Cross-Fitted DML** on the selected original observations.
+3. **Phase 3 — Wald Inference** from the AIPW pseudo-outcomes.
+
+The method is compared against **UNIF-DML** (naive uniform subsampling) and **FULL-DML** (gold standard).
 
 ---
 
@@ -24,19 +32,19 @@ The method is compared against uniform random subsampling (UNIF-DML) and full-da
 pip install -r requirements.txt
 ```
 
-**Key dependencies**: numpy, scipy, numba, scikit-learn, lightgbm, pandas, joblib, tqdm, matplotlib
+**Dependencies:** numpy, scipy, scikit-learn, lightgbm, pandas, joblib, tqdm, matplotlib.
 
 ---
 
 ## Quick Start
 
 ```python
-from data_generation import generate_obs_1_data
+from data_generation import generate_obs_3_data
 from methods import run_ud, run_unif
 import config
 
-# Generate synthetic data (10 covariates, 100k observations)
-data = generate_obs_1_data(n=100_000, p=10)
+# Generate synthetic data (10 covariates, 100k observations, low overlap)
+data = generate_obs_3_data(n=100_000, p=10)
 
 # UD-DML estimate with 5,000 subsample points
 ud_result = run_ud(
@@ -54,32 +62,31 @@ unif_result = run_unif(
     k_folds=config.K_FOLDS,
 )
 
-print("UD-DML ATE:", ud_result["est_ate"])
-print("UNIF ATE:", unif_result["est_ate"])
+print(f"UD-DML  ATE = {ud_result['est_ate']:.4f}  "
+      f"CI = [{ud_result['ci_lower']:.4f}, {ud_result['ci_upper']:.4f}]")
+print(f"UNIF    ATE = {unif_result['est_ate']:.4f}  "
+      f"CI = [{unif_result['ci_lower']:.4f}, {unif_result['ci_upper']:.4f}]")
 ```
-
-Each estimator returns: point estimate, 95% confidence interval, runtime, and actual subsample size.
 
 ---
 
 ## Data Scenarios
 
-The codebase includes **6 scenarios** (3 RCT + 3 Observational):
+Six DGPs are provided as a 2 × 3 factorial design (Table 1 of the paper):
 
-- **RCT-1, OBS-1**: Simple linear models, high overlap
-- **RCT-2, OBS-2**: Moderate non-linearity, moderate overlap  
-- **RCT-3, OBS-3**: Complex non-linear models, low overlap
+| Scenario | Covariates | Heterogeneity | Overlap |
+|----------|-----------|---------------|---------|
+| RCT-1 / OBS-1 | X1: Uniform | Low (linear) | High |
+| RCT-2 / OBS-2 | X2: Mixed | Moderate (non-linear) | Moderate |
+| RCT-3 / OBS-3 | X3: GMM + Normal | High (complex) | Low |
 
-All scenarios use **10 covariates** (`p=10`) with different distributions:
-- **X1**: Independent uniform
-- **X2**: Mixed marginals (uniform + normal)
-- **X3**: Gaussian mixture + standard normal
+All scenarios use **p = 10** covariates with true ATE θ₀ = 1.0.
 
 ---
 
 ## Running Experiments
 
-Run all experiments:
+Run all five experiments:
 
 ```bash
 python simulations.py
@@ -99,40 +106,35 @@ python simulations.py --fast-demo --jobs 1
 
 ### Available Experiments
 
-1. **`experiment_visualization`** - Visual comparison of UD vs UNIF subsamples
-2. **`experiment_subsample_size`** - Performance across subsample sizes {1k, 2.5k, 5k, 7.5k, 10k}
-3. **`experiment_population_size`** - Scalability with population sizes {100k, 500k}
-4. **`experiment_double_robust`** - Double-robustness tests with misspecified models
-5. **`experiment_nuisance_sensitivity`** - Comparison across learners (LightGBM, Lasso, Random Forest)
-
-### Output Files
-
-Results are saved to:
-- **Raw data**: `simulation_results/<experiment>/checkpoints/`
-- **Plots**: `analysis_results/<experiment>/figures/`
-- **Tables**: `analysis_results/<experiment>/tables/` (CSV and LaTeX formats)
+| Experiment | Description | Paper Section |
+|-----------|-------------|---------------|
+| `experiment_visualization` | 2-D covariate coverage diagnostics | — |
+| `experiment_subsample_size` | Performance vs subsample size r | §3.3, Exp 1 |
+| `experiment_population_size` | Scalability with population n | §3.3, Exp 2 |
+| `experiment_double_robust` | Double-robustness stress test | §3.3, Exp 3 |
+| `experiment_nuisance_sensitivity` | Learner comparison (LGBM, RF, LASSO) | §3.3, Exp 4 |
 
 ---
 
 ## Configuration
 
-Edit `config.py` to adjust settings:
+Edit `config.py` to adjust parameters:
 
 ```python
-# Simulation parameters
+# ── Simulation ──
 BASE_SEED = 20250919
-DEFAULT_REPLICATIONS = 500
+DEFAULT_REPLICATIONS = 1000
 N_POPULATION = 500_000
 K_FOLDS = 2
 
-# Nuisance learners (default: LightGBM)
+# ── UD-DML (Algorithm 1) ──
+UD_VARIANCE_THRESHOLD = 0.85    # ρ₀ for PCA retention (Step 3)
+UD_MAX_GENERATOR_CANDIDATES = 200  # GLP search budget (Step 6)
+UD_NEAREST_NEIGHBORS = 5       # Initial k for adaptive k-NN (Steps 16-17)
+
+# ── Nuisance learners ──
 DEFAULT_NUISANCE_LEARNER = 'lgbm'
 LGBM_N_ESTIMATORS = 100
-LGBM_MAX_DEPTH = 5
-
-# Subsample sizes
-SUBSAMPLE_TOTALS = [1_000, 2_500, 5_000, 7_500, 10_000]
-POPULATION_SIZE_GRID = [100_000, 500_000]
 ```
 
 ---
@@ -144,9 +146,10 @@ UD-DML/
 ├── config.py             # Configuration and experiment definitions
 ├── data_generation.py    # Data-generating processes (6 scenarios)
 ├── methods.py            # UD-DML, UNIF-DML, and FULL-DML estimators
-├── evaluation.py         # Post-processing and visualization
+├── evaluation.py         # Post-processing and visualisation
 ├── simulations.py        # Main experiment driver
 ├── requirements.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -154,7 +157,16 @@ UD-DML/
 
 ## Citation
 
-If you use this code, please cite the UD-DML manuscript.
+If you use this code, please cite:
+
+```bibtex
+@article{qu2026uddml,
+  title   = {UD-DML: Uniform Design Subsampling for Double Machine Learning
+             over Massive Data},
+  author  = {Qu, Yuanke and Xu, Xiaoya and Zhang, Hengtao},
+  year    = {2026}
+}
+```
 
 ---
 

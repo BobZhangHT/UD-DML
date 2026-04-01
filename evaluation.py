@@ -9,7 +9,7 @@ All content is in English.
 import colorsys
 import math
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -180,6 +180,141 @@ def _methods_present(df: pd.DataFrame, allowed: Iterable[str] | None = None) -> 
         if method in unique_methods:
             present.append(method)
     return present
+
+
+def _latex_population_size_publication_table(
+    display_df: pd.DataFrame,
+    method_labels: List[str],
+    metrics: List[str],
+) -> str:
+    """
+    Build publication-style LaTeX for the population / scalability table:
+    scaled $n$ and $r$ columns, grouped metric headers, RCT block then OBS block.
+    """
+    metric_display = {
+        "RMSE": "RMSE",
+        "CI_Coverage": "CI Coverage",
+        "CI_Width": "CI Width",
+        "Runtime": "Runtime",
+    }
+    caption = (
+        "Simulation results for the scalability experiment. Performance is evaluated as the full data size $n$ "
+        "increases from $10^5$ to $5 \\times 10^5$ while the computational budget $r$ remains fixed at two levels "
+        "($r=1000$ and $r=5000$). The table reports four key metrics: Root Mean Squared Error (RMSE), Coverage of "
+        "95\\% Confidence Interval (CI Coverage), CI Width, and wall-clock Runtime in seconds. Results compare our "
+        "proposed UD-DML (UD) method against the benchmark UNIF-DML (UNIF) and the DML estimator computed on the "
+        "full dataset (FULL)."
+    )
+    header_metrics = " & ".join(
+        f"\\multicolumn{{{len(method_labels)}}}{{c}}{{{metric_display[m]}}}" for m in metrics
+    )
+    lines = [
+        "\\begin{table}[htbp]",
+        "\\centering",
+        "\\scriptsize",
+        f"\\caption{{{caption}}}",
+        "\\label{tab:population_size_experiment}",
+        "\\setlength{\\tabcolsep}{4.5pt}",
+        "\\begin{tabular}{lccrrrrrrrrrrrr}",
+        "\\toprule",
+        "\\multicolumn{1}{c}{DGP} & \\multicolumn{1}{c}{$n(\\times 10^5)$} & "
+        "\\multicolumn{1}{c}{$r(\\times 10^3)$} & "
+        + header_metrics
+        + " \\\\",
+        "\\cmidrule(lr){4-6}\\cmidrule(lr){7-9}\\cmidrule(lr){10-12}\\cmidrule(lr){13-15}",
+        " &  &  & " + " & ".join(method_labels * len(metrics)) + " \\\\",
+        "\\midrule",
+    ]
+    prev_scenario = None
+    prev_pop: Optional[int] = None
+    for _, row in display_df.iterrows():
+        scen = str(row["Scenario"])
+        pop = int(row["Population"])
+        sub = int(row["Subsample"])
+        if scen.startswith("OBS") and prev_scenario is not None and str(prev_scenario).startswith("RCT"):
+            lines.append("\\midrule")
+        dgp_cell = scen if scen != prev_scenario else ""
+        if scen != prev_scenario:
+            prev_pop = None
+        n_cell = str(pop // 100_000) if prev_pop is None or pop != prev_pop else ""
+        r_cell = str(sub // 1000)
+        cells = [dgp_cell, n_cell, r_cell]
+        for metric in metrics:
+            for method in method_labels:
+                col = f"{metric}_{method}"
+                cells.append(str(row.get(col, "")))
+        lines.append(" & ".join(cells) + " \\\\")
+        prev_scenario = scen
+        prev_pop = pop
+    lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
+    return "\n".join(lines)
+
+
+def _latex_double_robust_publication_table(
+    display_df: pd.DataFrame,
+    method_labels: List[str],
+    metric_keys: List[str],
+) -> str:
+    """
+    Publication-style LaTeX for the double-robustness table: grouped headers, $m$/$e$ labels,
+    right-aligned metrics, repeated Scenario column blank within each OBS block.
+    """
+    metric_display = {
+        "RMSE": "RMSE",
+        "CI_Coverage": "CI Coverage",
+        "CI_Width": "CI Width",
+    }
+    caption = (
+        "Results for the third simulation experiment, evaluating double robustness. The experiment is run on "
+        "observational scenarios (OBS-1, 2, 3) with $n=5\\times 10^5$ and $r=5000$. Performance metrics "
+        "(RMSE, CI Coverage, CI Width) are compared for UD-DML (UD) and UNIF-DML (UNIF) under four nuisance "
+        "model specifications: (Correct, Correct), (Correct, Wrong), (Wrong, Correct), and (Wrong, Wrong) "
+        "for the outcome ($m$) and propensity ($e$) models, respectively."
+    )
+    n_metrics = len(metric_keys)
+    n_methods = len(method_labels)
+    n_num_cols = n_metrics * n_methods
+    col_spec = "lll" + ("r" * n_num_cols)
+    cmid_parts = []
+    col = 4
+    for _ in range(n_metrics):
+        cmid_parts.append(f"\\cmidrule(lr){{{col}-{col + n_methods - 1}}}")
+        col += n_methods
+    cmid_line = " ".join(cmid_parts)
+    header_metrics = " & ".join(
+        f"\\multicolumn{{{n_methods}}}{{c}}{{{metric_display[m]}}}" for m in metric_keys
+    )
+    lines = [
+        "\\begin{table}[htbp]",
+        "\\centering",
+        f"\\caption{{{caption}}}",
+        "\\label{tab:double_robust_experiment}",
+        "\\setlength{\\tabcolsep}{6pt}",
+        f"\\begin{{tabular}}{{{col_spec}}}",
+        "\\toprule",
+        "\\multicolumn{1}{c}{Scenario} & \\multicolumn{1}{c}{Outcome ($m$)} & "
+        "\\multicolumn{1}{c}{Propensity ($e$)} & "
+        + header_metrics
+        + " \\\\",
+        cmid_line,
+        " & & & " + " & ".join(method_labels * n_metrics) + " \\\\",
+        "\\midrule",
+    ]
+    prev_scenario = None
+    for _, row in display_df.iterrows():
+        scen = str(row["Scenario"])
+        if scen != prev_scenario and prev_scenario is not None:
+            lines.append("\\midrule")
+        scen_cell = scen if scen != prev_scenario else ""
+        cells = [scen_cell, str(row["Outcome"]), str(row["Propensity"])]
+        for mk in metric_keys:
+            for method in method_labels:
+                cells.append(str(row.get(f"{mk}_{method}", "")))
+        lines.append(" & ".join(cells) + " \\\\")
+        prev_scenario = scen
+    lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
+    return "\n".join(lines)
+
 
 # =============================================================================
 # Data preparation
@@ -710,9 +845,10 @@ def _population_size_reports(
                 records.append(row)
 
     if records:
-        table_df = pd.DataFrame(records).sort_values(
-            ["Scenario", "Population", "Subsample"]
-        )
+        table_df = pd.DataFrame(records)
+        scen_cats = [s for s in scenario_order if s in set(table_df["Scenario"].unique())]
+        table_df["Scenario"] = pd.Categorical(table_df["Scenario"], categories=scen_cats, ordered=True)
+        table_df = table_df.sort_values(["Scenario", "Population", "Subsample"])
         # Truncate digits for readability
         format_map = {col: "{:.3f}" for col in table_df.columns if col.startswith("RMSE")}
         format_map.update({col: "{:.3f}" for col in table_df.columns if col.startswith("CI_Width")})
@@ -728,60 +864,12 @@ def _population_size_reports(
         csv_path = tables_dir / "population_size_publication_table.csv"
         display_df.to_csv(csv_path, index=False)
 
-        # LaTeX table with multi-level header
         method_labels = list(methods_present)
-        metric_display = {
-            "RMSE": "RMSE",
-            "CI_Coverage": "CI Coverage",
-            "CI_Width": "CI Width",
-            "Runtime": "Runtime",
-        }
-        metric_headers = []
-        for metric in metrics:
-            metric_headers.extend([metric_display[metric]] * len(method_labels))
-        sub_headers = method_labels * len(metrics)
-
-        latex_lines = []
-        latex_lines.append("\\begin{table}[htbp]")
-        latex_lines.append("\\centering")
-        column_spec = "lll" + "c" * (len(metric_headers))
-        latex_lines.append(f"\\begin{{tabular}}{{{column_spec}}}")
-        latex_lines.append("\\toprule")
-        header_top = ["Scenario", "Population", "Subsample"]
-        header_top += [
-            f"\\multicolumn{{{len(method_labels)}}}{{c}}{{{metric_display[metric]}}}"
-            for metric in metrics
-        ]
-        latex_lines.append(" & ".join(header_top) + " \\\\")
-        # Column separators for metric blocks
-        start_col = 4
-        for idx in range(len(metrics)):
-            left = start_col + idx * len(method_labels)
-            right = left + len(method_labels) - 1
-            latex_lines.append(f"\\cmidrule(lr){{{left}-{right}}}")
-        header_second = ["", "", ""]
-        header_second += [method for method in sub_headers]
-        latex_lines.append(" & ".join(header_second) + " \\\\")
-        latex_lines.append("\\midrule")
-        for _, row in display_df.iterrows():
-            cells = [
-                row["Scenario"],
-                f"{int(row['Population']):,}",
-                f"{int(row['Subsample']):,}",
-            ]
-            for metric in ["RMSE", "CI_Coverage", "CI_Width", "Runtime"]:
-                for method in method_labels:
-                    col = f"{metric}_{method}"
-                    cells.append(row.get(col, ""))
-            latex_lines.append(" & ".join(cells) + " \\\\")
-        latex_lines.append("\\bottomrule")
-        latex_lines.append("\\end{tabular}")
-        latex_lines.append("\\caption{Population size experiment summary.}")
-        latex_lines.append("\\label{tab:population_size}")
-        latex_lines.append("\\end{table}")
-
         tex_path = tables_dir / "population_size_publication_table.tex"
-        tex_path.write_text("\n".join(latex_lines), encoding="utf-8")
+        tex_path.write_text(
+            _latex_population_size_publication_table(display_df, method_labels, metrics),
+            encoding="utf-8",
+        )
 
     for r_total in r_totals:
         fig, axes = plt.subplots(len(scenarios_present), len(metrics), figsize=(16, 4 * len(scenarios_present)), sharex=True)
@@ -906,9 +994,10 @@ def _double_robust_reports(
             table_records.append(row)
 
     if table_records:
-        table_df = pd.DataFrame(table_records).sort_values(
-            ["Scenario", "Outcome", "Propensity"]
-        )
+        table_df = pd.DataFrame(table_records)
+        scen_cats = [s for s in obs_scenarios if s in set(table_df["Scenario"].unique())]
+        table_df["Scenario"] = pd.Categorical(table_df["Scenario"], categories=scen_cats, ordered=True)
+        table_df = table_df.sort_values(["Scenario", "Outcome", "Propensity"])
         format_map = {
             key: "{:.3f}" for key in table_df.columns if key.startswith(("RMSE_", "CI_Width_"))
         }
@@ -924,47 +1013,12 @@ def _double_robust_reports(
         display_df.to_csv(csv_path, index=False)
 
         metric_keys = [m[0] for m in metrics]
-        metric_display = {
-            "RMSE": "RMSE",
-            "CI_Coverage": "CI Coverage",
-            "CI_Width": "CI Width",
-        }
         method_labels = list(methods_present)
-        latex_lines = []
-        latex_lines.append("\\begin{table}[htbp]")
-        latex_lines.append("\\centering")
-        column_spec = "lll" + "c" * (len(metric_keys) * len(method_labels))
-        latex_lines.append(f"\\begin{{tabular}}{{{column_spec}}}")
-        latex_lines.append("\\toprule")
-        header_top = ["Scenario", "Outcome", "Propensity"]
-        header_top += [
-            f"\\multicolumn{{{len(method_labels)}}}{{c}}{{{metric_display[m]}}}"
-            for m in metric_keys
-        ]
-        latex_lines.append(" & ".join(header_top) + " \\\\")
-        start_col = 4
-        for idx in range(len(metric_keys)):
-            left = start_col + idx * len(method_labels)
-            right = left + len(method_labels) - 1
-            latex_lines.append(f"\\cmidrule(lr){{{left}-{right}}}")
-        header_second = ["", "", ""]
-        header_second += method_labels * len(metric_keys)
-        latex_lines.append(" & ".join(header_second) + " \\\\")
-        latex_lines.append("\\midrule")
-        for _, row in display_df.iterrows():
-            cells = [row["Scenario"], row["Outcome"], row["Propensity"]]
-            for metric_key in metric_keys:
-                for method in method_labels:
-                    col = f"{metric_key}_{method}"
-                    cells.append(row.get(col, ""))
-            latex_lines.append(" & ".join(cells) + " \\\\")
-        latex_lines.append("\\bottomrule")
-        latex_lines.append("\\end{tabular}")
-        latex_lines.append("\\caption{Double robustness experiment summary.}")
-        latex_lines.append("\\label{tab:double_robust}")
-        latex_lines.append("\\end{table}")
         tex_path = tables_dir / "double_robust_publication_table.tex"
-        tex_path.write_text("\n".join(latex_lines), encoding="utf-8")
+        tex_path.write_text(
+            _latex_double_robust_publication_table(display_df, method_labels, metric_keys),
+            encoding="utf-8",
+        )
 
     fig, axes = plt.subplots(
         len(obs_scenarios),
