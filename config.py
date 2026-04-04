@@ -58,19 +58,18 @@ Following Zhang et al. (2023) and Zhou et al. (2024), the default is 0.85.
 When the covariates are already uncorrelated and equi-variant, q = p.
 """
 
-UD_MAX_GENERATOR_CANDIDATES: int = 200
-"""Maximum number of admissible power generators to evaluate (Step 6).
+UD_MAX_GENERATOR_CANDIDATES: int = 30
+"""Budget B_γ: maximum number of admissible power generators to evaluate (Algorithm 1).
 
-If the total number of admissible α exceeds this value, a random subset
-is drawn and searched (Section 2.2, paragraph following the definition
-of α̂).
+If the total number of admissible α exceeds B_γ, a random subset of size
+B_γ is drawn and searched (quasi-optimal / budgeted search, Section 2.2).
 """
 
 UD_NEAREST_NEIGHBORS: int = 5
-"""Initial k for the adaptive nearest-neighbour query (Steps 16–17).
+"""Legacy parameter kept for config compatibility.
 
-The query expands adaptively (k ← min(n_arm, 2k)) until an unused unit
-is found.  A small initial k keeps the typical cost close to O(log n).
+The main UD-DML path uses exact 1-NN matching *with* replacement in Z-space
+(Algorithm 1); this key is not used by ``methods.run_ud``.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════

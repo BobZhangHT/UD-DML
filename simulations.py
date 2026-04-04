@@ -4,7 +4,12 @@
 simulations.py
 
 Unified simulation driver for the UD-DML study.
-This script orchestrates five experiment families described in UD_DML.pdf:
+This script orchestrates five experiment families described in UD_DML.pdf.
+Before those families, each ``run_all`` first runs ``bgamma_sensitivity`` and
+``efficiency_profile`` (OBS-3, ``n=10^5``, ``r=1000``; 100 replications in full mode,
+10 under ``--fast-demo``).
+
+Main experiment families:
 
 1. Covariate space visualisation (UD vs. UNIF)
 2. Subsample-budget comparison across all DGPs
@@ -18,19 +23,24 @@ stores raw outputs, and delegates aggregation/visualisation to
 """
 
 import argparse
+import csv
 import pickle
 import time
 import traceback
 import gzip
 import os
+import math
 from pathlib import Path
+from typing import List, Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
 import config
 import evaluation
+import methods
 
 # =============================================================================
 # Constants & paths
@@ -40,6 +50,16 @@ FAST_DEMO_MODE = False
 FAST_DEMO_OVERRIDES = {
     "n_replications": 10,
 }
+# Standalone UD profiling experiments (efficiency_profile, bgamma_sensitivity): full scale,
+# replications = 100 in normal runs and FAST_DEMO_OVERRIDES["n_replications"] in --fast-demo.
+ADDON_EXPERIMENT_SCENARIO: str = "OBS-3"
+ADDON_EXPERIMENT_N: int = 100_000
+ADDON_EXPERIMENT_R_TOTAL: int = 1_000
+ADDON_EXPERIMENT_REPLICATIONS_FULL: int = 100
+
+# Standalone profiling outputs (efficiency profile, B_gamma sensitivity) live here.
+ANALYSIS_RESULTS_ROOT = Path("analysis_results")
+
 MAX_PARALLEL_JOBS = config.MAX_PARALLEL_JOBS
 ENV_MAX_JOBS = os.environ.get("OS_DML_MAX_JOBS")
 if ENV_MAX_JOBS:
@@ -373,6 +393,456 @@ def _task_population(task):
     return int(population)
 
 
+def _addon_experiment_replications() -> int:
+    """Replications for efficiency_profile / bgamma_sensitivity when invoked from run_all."""
+    if FAST_DEMO_MODE:
+        return int(FAST_DEMO_OVERRIDES["n_replications"])
+    return int(ADDON_EXPERIMENT_REPLICATIONS_FULL)
+
+
+def run_profiling_before_experiment_families() -> None:
+    """Run ``bgamma_sensitivity`` then ``efficiency_profile`` (OBS-3, n, r_total).
+
+    Invoked at the start of ``run_all`` so profiling completes before the five
+    config experiment families. Replication count: 100 (full) or 10 (``--fast-demo``).
+    """
+    reps = _addon_experiment_replications()
+    print(f"\n{'='*80}\nPRE-MAIN: bgamma_sensitivity ({reps} reps, demo={FAST_DEMO_MODE})\n{'='*80}")
+    out_bg = run_bgamma_sensitivity_experiment(
+        scenario=ADDON_EXPERIMENT_SCENARIO,
+        n=ADDON_EXPERIMENT_N,
+        replications=reps,
+        r_total=ADDON_EXPERIMENT_R_TOTAL,
+    )
+    print(f"-> bgamma_sensitivity -> {out_bg.resolve()}")
+    print(f"\n{'='*80}\nPRE-MAIN: efficiency_profile ({reps} reps, demo={FAST_DEMO_MODE})\n{'='*80}")
+    out_eff = run_efficiency_profile_experiment(
+        scenario=ADDON_EXPERIMENT_SCENARIO,
+        n=ADDON_EXPERIMENT_N,
+        replications=reps,
+        r_total=ADDON_EXPERIMENT_R_TOTAL,
+    )
+    print(f"-> efficiency_profile -> {out_eff.resolve()}")
+
+
+PROFILE_STEP_KEYS: List[str] = [
+    "standardize_pca",
+    "ecdf_sort",
+    "design_search",
+    "inverse_cdf_map",
+    "kd_build",
+    "matching",
+    "dml",
+    "inference",
+]
+
+# Publication-friendly stage labels for efficiency-profile tables (LaTeX text mode).
+PROFILE_STEP_LABELS_TEX: dict = {
+    "standardize_pca": r"Standardize + PCA",
+    "ecdf_sort": r"ECDF sort",
+    "design_search": r"Design search",
+    "inverse_cdf_map": r"Inverse CDF map",
+    "kd_build": r"$k$-d tree build",
+    "matching": r"Matching",
+    "dml": r"DML (nuisance + outcome)",
+    "inference": r"Inference",
+}
+
+
+def _require_columns(row: dict, required: set, context: str) -> None:
+    missing = required.difference(row.keys())
+    if missing:
+        raise KeyError(f"{context}: missing columns {sorted(missing)}")
+
+
+def run_efficiency_profile_experiment(
+    scenario: str = "OBS-3",
+    n: int = 100_000,
+    replications: int = 100,
+    r_total: int = 1_000,
+    output_root: Optional[Path] = None,
+) -> Path:
+    """Profile UD-DML wall times per algorithm stage (single scenario, many replications).
+
+    Writes ``profile_rows.csv``, ``profile_shares.csv``, two boxplot figures,
+    ``profile_summary.md``, and ``efficiency_profile_table.tex`` under
+    ``analysis_results/efficiency_profile/`` (unless ``output_root`` is set).
+    """
+    scenarios, _, _ = config.get_experiments()
+    if scenario not in scenarios:
+        raise ValueError(f"Unknown scenario {scenario!r}.")
+    scenario_cfg = scenarios[scenario]
+    out_dir = output_root or (ANALYSIS_RESULTS_ROOT / "efficiency_profile")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    header = [
+        "replication",
+        "scenario",
+        "n",
+        "r_total",
+        "B_gamma",
+    ] + PROFILE_STEP_KEYS + ["total"]
+
+    rows = []
+    B_gamma = int(getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30))
+
+    for rep in tqdm(range(replications), desc="efficiency_profile"):
+        sim_seed = int(config.BASE_SEED) + int(rep)
+        np.random.seed(sim_seed)
+        data_params = dict(scenario_cfg["params"])
+        data_params["n"] = int(n)
+        data = scenario_cfg["data_gen_func"](**data_params)
+        out = methods.run_ud(
+            data["X"],
+            data["W"],
+            data["Y_obs"],
+            data["pi_true"],
+            scenario_cfg["design"] == "rct",
+            {"r_total": int(r_total)},
+            k_folds=config.K_FOLDS,
+            sim_seed=sim_seed,
+            return_profile=True,
+            learner=config.DEFAULT_NUISANCE_LEARNER,
+        )
+        tb = out.get("time_breakdown")
+        if not isinstance(tb, dict):
+            raise RuntimeError("run_ud(..., return_profile=True) must return time_breakdown dict.")
+        _require_columns(tb, set(PROFILE_STEP_KEYS + ["total"]), "time_breakdown")
+        record = {
+            "replication": rep,
+            "scenario": scenario,
+            "n": int(n),
+            "r_total": int(r_total),
+            "B_gamma": B_gamma,
+        }
+        for k in PROFILE_STEP_KEYS:
+            record[k] = float(tb[k])
+        record["total"] = float(tb["total"])
+        rows.append(record)
+
+    rows_path = out_dir / "profile_rows.csv"
+    with rows_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerows(rows)
+
+    share_header = header.copy()
+    shares_path = out_dir / "profile_shares.csv"
+    share_rows = []
+    for r in rows:
+        tot = float(r["total"])
+        if tot <= 0.0:
+            raise ValueError("total time must be positive.")
+        sr = {k: r[k] for k in ["replication", "scenario", "n", "r_total", "B_gamma"]}
+        for k in PROFILE_STEP_KEYS:
+            sr[k] = float(r[k]) / tot
+        sr["total"] = 1.0
+        share_rows.append(sr)
+
+    with shares_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=share_header)
+        w.writeheader()
+        w.writerows(share_rows)
+
+    # Raw times boxplot
+    fig, ax = plt.subplots(figsize=(10, 4))
+    data_cols = [ [ float(r[k]) for r in rows ] for k in PROFILE_STEP_KEYS ]
+    ax.boxplot(data_cols, labels=PROFILE_STEP_KEYS, showmeans=True)
+    ax.set_ylabel("Time (s)")
+    ax.set_title("UD-DML stage times (raw)")
+    plt.xticks(rotation=35, ha="right")
+    fig.tight_layout()
+    fig.savefig(out_dir / "time_raw_boxplot.png", dpi=200)
+    plt.close(fig)
+
+    # Cumulative share boxplots (stacked-style diagnostic)
+    cum = np.zeros((len(rows), len(PROFILE_STEP_KEYS)))
+    for i, r in enumerate(rows):
+        tot = float(r["total"])
+        cumul = 0.0
+        for j, k in enumerate(PROFILE_STEP_KEYS):
+            cumul += float(r[k]) / tot
+            cum[i, j] = cumul
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    positions = np.arange(1, len(PROFILE_STEP_KEYS) + 1)
+    ax.boxplot([cum[:, j] for j in range(len(PROFILE_STEP_KEYS))], positions=positions, showmeans=True)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f"≤{k}" for k in PROFILE_STEP_KEYS], rotation=35, ha="right")
+    ax.set_ylim(0.0, 1.05)
+    ax.set_ylabel("Cumulative time share")
+    ax.set_title("Cumulative time share by pipeline stage (boxplots)")
+    ax.axhline(1.0, color="gray", ls=":", lw=1)
+    fig.tight_layout()
+    fig.savefig(out_dir / "time_share_stacked_boxplot.png", dpi=200)
+    plt.close(fig)
+
+    totals = [float(r["total"]) for r in rows]
+    totals_sorted = sorted(totals)
+    med_total = totals_sorted[len(totals_sorted) // 2]
+
+    med_share = {}
+    mean_share = {}
+    for k in PROFILE_STEP_KEYS:
+        s = [float(r[k]) / float(r["total"]) for r in rows]
+        s_sorted = sorted(s)
+        med_share[k] = s_sorted[len(s_sorted) // 2]
+        mean_share[k] = float(np.mean(s))
+
+    bottleneck = max(PROFILE_STEP_KEYS, key=lambda kk: med_share[kk])
+    ds_med = med_share.get("design_search", 0.0)
+    ds_dominates = ds_med >= max(med_share[k] for k in PROFILE_STEP_KEYS if k != "design_search")
+
+    summary_path = out_dir / "profile_summary.md"
+    lines = [
+        "# UD-DML efficiency profile summary",
+        "",
+        f"- **Scenario:** {scenario}, **n:** {n}, **r_total:** {r_total}, **replications:** {replications}",
+        f"- **Median total runtime (s):** {med_total:.4f}",
+        "",
+        "## Median / mean time share by stage",
+        "",
+        "| Stage | Median share | Mean share |",
+        "|---|---:|---:|",
+    ]
+    for k in PROFILE_STEP_KEYS:
+        lines.append(f"| {k} | {med_share[k]:.4f} | {mean_share[k]:.4f} |")
+    lines.extend(
+        [
+            "",
+            f"- **Largest median share (bottleneck):** `{bottleneck}`",
+            f"- **design_search dominates (median share ≥ every other stage):** {ds_dominates}",
+            "",
+            "## Interpretation",
+            "",
+            "The breakdown shows where wall time concentrates across Monte Carlo replications. "
+            "Stages with the highest median shares drive throughput; if `design_search` is largest, "
+            "the budgeted GLP / mixture-discrepancy loop dominates, whereas a large `dml` share "
+            "indicates nuisance cross-fitting is the main cost on this configuration.",
+        ]
+    )
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+    n_tex = f"{int(n):,}".replace(",", r"\,")
+    rep_word = "replications" if replications != 1 else "replication"
+    cap = (
+        r"Share of total wall-clock time by pipeline stage for UD-DML on "
+        f"{scenario} ($n={n_tex}$, $r_{{\\mathrm{{total}}}}={int(r_total)}$, "
+        f"$B_\\gamma={int(B_gamma)}$, {int(replications)} Monte Carlo {rep_word}). "
+        f"Median total elapsed time: ${med_total:.4f}$~s. "
+        r"For each stage, \emph{Median} and \emph{Mean} are the median and mean, "
+        r"over replications, of that stage's fraction of total runtime (in percent)."
+    )
+    tex_lines = [
+        "% Preamble (main LaTeX document): \\usepackage{booktabs}",
+        r"\begin{table}[htbp]",
+        r"\centering",
+        "\\caption{" + cap + "}",
+        r"\label{tab:ud_dml_efficiency_profile}",
+        r"\begin{tabular}{@{}lrr@{}}",
+        r"\toprule",
+        r"Stage & Median (\%) & Mean (\%) \\",
+        r"\midrule",
+    ]
+    for k in PROFILE_STEP_KEYS:
+        lab = PROFILE_STEP_LABELS_TEX.get(k, k.replace("_", r"\_"))
+        pct_med = 100.0 * float(med_share[k])
+        pct_mean = 100.0 * float(mean_share[k])
+        tex_lines.append(f"{lab} & {pct_med:.2f} & {pct_mean:.2f} \\\\")
+    tex_lines.extend(
+        [
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\end{table}",
+        ]
+    )
+    (out_dir / "efficiency_profile_table.tex").write_text(
+        "\n".join(tex_lines), encoding="utf-8"
+    )
+
+    return out_dir
+
+
+def run_bgamma_sensitivity_experiment(
+    scenario: str = "OBS-3",
+    n: int = 100_000,
+    replications: int = 100,
+    r_total: int = 1_000,
+    bgamma_grid: Optional[List[int]] = None,
+    output_root: Optional[Path] = None,
+) -> Path:
+    """Monte Carlo sweep over generator budget ``B_gamma`` for UD-DML (single scenario).
+
+    Saves per-replication CSV, an aggregated summary, a LaTeX table, and a two-panel figure.
+    """
+    scenarios, _, _ = config.get_experiments()
+    if scenario not in scenarios:
+        raise ValueError(f"Unknown scenario {scenario!r}.")
+    scenario_cfg = scenarios[scenario]
+    grid = list(bgamma_grid or [10, 20, 30, 40, 60])
+    out_dir = output_root or (ANALYSIS_RESULTS_ROOT / "bgamma_sensitivity")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    detail_header = [
+        "scenario",
+        "n",
+        "replication",
+        "B_gamma",
+        "est_ate",
+        "ci_lower",
+        "ci_upper",
+        "runtime",
+        "subsample_size",
+        "subsample_unique",
+        "true_ate",
+    ]
+    detail_rows = []
+
+    for B_gamma in grid:
+        for rep in tqdm(
+            range(replications),
+            desc=f"B_gamma={B_gamma}",
+        ):
+            sim_seed = int(config.BASE_SEED) + int(rep) * 10_007 + int(B_gamma)
+            np.random.seed(sim_seed)
+            data_params = dict(scenario_cfg["params"])
+            data_params["n"] = int(n)
+            data = scenario_cfg["data_gen_func"](**data_params)
+            true_ate = float(data["true_ate"])
+            out = methods.run_ud(
+                data["X"],
+                data["W"],
+                data["Y_obs"],
+                data["pi_true"],
+                scenario_cfg["design"] == "rct",
+                {"r_total": int(r_total)},
+                k_folds=config.K_FOLDS,
+                sim_seed=sim_seed,
+                B_gamma=int(B_gamma),
+                learner=config.DEFAULT_NUISANCE_LEARNER,
+            )
+            req = {"est_ate", "ci_lower", "ci_upper", "runtime", "subsample_size", "subsample_unique"}
+            _require_columns(out, req, "run_ud output")
+            detail_rows.append(
+                {
+                    "scenario": scenario,
+                    "n": int(n),
+                    "replication": rep,
+                    "B_gamma": int(B_gamma),
+                    "est_ate": out["est_ate"],
+                    "ci_lower": out["ci_lower"],
+                    "ci_upper": out["ci_upper"],
+                    "runtime": out["runtime"],
+                    "subsample_size": out["subsample_size"],
+                    "subsample_unique": out["subsample_unique"],
+                    "true_ate": true_ate,
+                }
+            )
+
+    detail_path = out_dir / "bgamma_sensitivity.csv"
+    with detail_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=detail_header)
+        w.writeheader()
+        w.writerows(detail_rows)
+
+    summary_rows = []
+    for B_gamma in grid:
+        sub = [r for r in detail_rows if int(r["B_gamma"]) == int(B_gamma)]
+        ests = np.array([float(r["est_ate"]) for r in sub], dtype=np.float64)
+        truths = np.array([float(r["true_ate"]) for r in sub], dtype=np.float64)
+        runtimes = np.array([float(r["runtime"]) for r in sub], dtype=np.float64)
+        widths = np.array(
+            [float(r["ci_upper"]) - float(r["ci_lower"]) for r in sub],
+            dtype=np.float64,
+        )
+        covered = []
+        for r in sub:
+            covered.append(
+                float(r["ci_lower"]) <= float(r["true_ate"]) <= float(r["ci_upper"])
+            )
+        rmse = float(math.sqrt(np.mean((ests - truths) ** 2)))
+        summary_rows.append(
+            {
+                "B_gamma": int(B_gamma),
+                "mean_runtime": float(np.mean(runtimes)),
+                "median_runtime": float(np.median(runtimes)),
+                "mean_est_ate": float(np.mean(ests)),
+                "sd_est_ate": float(np.std(ests, ddof=1)) if len(ests) > 1 else 0.0,
+                "rmse": rmse,
+                "mean_ci_width": float(np.mean(widths)),
+                "coverage_95": float(np.mean(covered)),
+            }
+        )
+
+    sum_header = [
+        "B_gamma",
+        "mean_runtime",
+        "median_runtime",
+        "mean_est_ate",
+        "sd_est_ate",
+        "rmse",
+        "mean_ci_width",
+        "coverage_95",
+    ]
+    sum_path = out_dir / "bgamma_sensitivity_summary.csv"
+    with sum_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=sum_header)
+        w.writeheader()
+        w.writerows(summary_rows)
+
+    cap_body = (
+        f"UD-DML sensitivity to the generator budget $B_\\gamma$ on {scenario} "
+        f"($n={int(n)}$)."
+    )
+    tex_lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        "\\caption{" + cap_body + "}",
+        r"\label{tab:bgamma_sensitivity}",
+        r"\begin{tabular}{@{}lrrrrr@{}}",
+        r"\toprule",
+        r"$B_\gamma$ & Mean Runtime & Median Runtime & RMSE & Mean CI Width & Coverage \\",
+        r"\midrule",
+    ]
+    for sr in summary_rows:
+        tex_lines.append(
+            f"{int(sr['B_gamma'])} & {sr['mean_runtime']:.3f} & {sr['median_runtime']:.3f} & "
+            f"{sr['rmse']:.4f} & {sr['mean_ci_width']:.4f} & {sr['coverage_95']:.2f} \\\\"
+        )
+    tex_lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
+    (out_dir / "bgamma_sensitivity_table.tex").write_text("\n".join(tex_lines), encoding="utf-8")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    xs = [int(s["B_gamma"]) for s in summary_rows]
+    ax1.plot(xs, [s["mean_runtime"] for s in summary_rows], "o-", label="Mean")
+    ax1.plot(xs, [s["median_runtime"] for s in summary_rows], "s--", label="Median")
+    ax1.set_xlabel(r"$B_\gamma$")
+    ax1.set_ylabel("Runtime (s)")
+    ax1.set_title("Runtime vs generator budget")
+    ax1.legend()
+    ax1.grid(True, ls="--", alpha=0.3)
+
+    ax2.plot(xs, [s["rmse"] for s in summary_rows], "o-", color="C1", label="RMSE")
+    ax3 = ax2.twinx()
+    ax3.plot(xs, [s["coverage_95"] for s in summary_rows], "s--", color="C2", label="Coverage")
+    ax2.set_xlabel(r"$B_\gamma$")
+    ax2.set_ylabel("RMSE", color="C1")
+    ax3.set_ylabel("Coverage", color="C2")
+    ax2.set_title(r"Precision metrics vs $B_\gamma$")
+    ax2.tick_params(axis="y", labelcolor="C1")
+    ax3.tick_params(axis="y", labelcolor="C2")
+    h1, l1 = ax2.get_legend_handles_labels()
+    h2, l2 = ax3.get_legend_handles_labels()
+    ax2.legend(h1 + h2, l1 + l2, loc="best")
+    ax2.grid(True, ls="--", alpha=0.3)
+    fig.suptitle(f"{scenario}, n={n}, r={r_total}")
+    fig.tight_layout()
+    fig.savefig(out_dir / "bgamma_sensitivity_plot.png", dpi=200)
+    plt.close(fig)
+
+    return out_dir
+
+
 def run_experiment(exp_name, n_jobs=-1):
     """Run one experiment as defined in config."""
     print(f"\n{'='*80}\n{exp_name.upper()}\n{'='*80}")
@@ -514,7 +984,12 @@ def run_experiment(exp_name, n_jobs=-1):
 
 
 def run_all(experiments=None, n_jobs=-1, fast_demo=False):
-    """Run all (or selected) experiments."""
+    """Run UD profiling analyses, then all (or selected) config experiment families.
+
+    First runs ``bgamma_sensitivity`` and ``efficiency_profile`` on OBS-3 with
+    ``n=100_000`` and ``r_total=1_000``. Replications are 100 in normal mode and
+    10 when ``fast_demo=True`` (``--fast-demo``). Then runs the main experiment loop.
+    """
     global FAST_DEMO_MODE
     FAST_DEMO_MODE = fast_demo
     _, _, experiment_catalog = config.get_experiments()
@@ -522,6 +997,8 @@ def run_all(experiments=None, n_jobs=-1, fast_demo=False):
         experiments = list(experiment_catalog.keys())
 
     start = time.time()
+    run_profiling_before_experiment_families()
+
     for exp_name in experiments:
         if exp_name not in experiment_catalog:
             print(f"Warning: '{exp_name}' not found in configuration. Skipping.")
@@ -529,7 +1006,7 @@ def run_all(experiments=None, n_jobs=-1, fast_demo=False):
         run_experiment(exp_name, n_jobs=n_jobs)
 
     elapsed = time.time() - start
-    print(f"\nAll requested experiments completed in {elapsed/3600:.2f} hours.")
+    print(f"\nAll requested experiments (profiling first, then main suite) completed in {elapsed/3600:.2f} hours.")
 
 
 # =============================================================================
@@ -539,6 +1016,38 @@ def run_all(experiments=None, n_jobs=-1, fast_demo=False):
 def parse_args():
     parser = argparse.ArgumentParser(
         description="UD-DML simulation runner for redesigned experiments."
+    )
+    parser.add_argument(
+        "--experiment",
+        type=str,
+        default=None,
+        choices=("efficiency_profile", "bgamma_sensitivity"),
+        help="Run a standalone add-on experiment (efficiency profile or B_gamma sensitivity).",
+    )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default="OBS-3",
+        help="Scenario key for --experiment runs (default: OBS-3).",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=100_000,
+        help="Population size n for --experiment runs (default: 100000).",
+    )
+    parser.add_argument(
+        "--replications",
+        type=int,
+        default=100,
+        help="Monte Carlo replications for --experiment runs (default: 100).",
+    )
+    parser.add_argument(
+        "--r-total",
+        type=int,
+        default=1_000,
+        dest="r_total",
+        help="UD / UNIF subsample budget r_total for --experiment runs (default: 1000).",
     )
     parser.add_argument(
         "--experiments",
@@ -555,13 +1064,35 @@ def parse_args():
     parser.add_argument(
         "--fast-demo",
         action="store_true",
-        help="Enable fast-demo mode (reduced grids/replications, dedicated output folder).",
+        help=(
+            "Enable fast-demo mode (reduced grids/replications, dedicated output folder). "
+            "Pre-main efficiency_profile / bgamma_sensitivity use 10 replications."
+        ),
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.experiment == "efficiency_profile":
+        out = run_efficiency_profile_experiment(
+            scenario=args.scenario,
+            n=args.n,
+            replications=args.replications,
+            r_total=args.r_total,
+        )
+        print(f"efficiency_profile outputs -> {out.resolve()}")
+        return
+    if args.experiment == "bgamma_sensitivity":
+        out = run_bgamma_sensitivity_experiment(
+            scenario=args.scenario,
+            n=args.n,
+            replications=args.replications,
+            r_total=args.r_total,
+        )
+        print(f"bgamma_sensitivity outputs -> {out.resolve()}")
+        return
+
     run_all(experiments=args.experiments, n_jobs=args.jobs, fast_demo=args.fast_demo)
 
 

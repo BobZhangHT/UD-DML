@@ -27,9 +27,9 @@ Algorithm overview (UD-DML)
        discrepancy D²_M.
     4. Map the skeleton to the rotated space through the marginal
        empirical inverse CDFs:  v_j = F̂_Z⁻¹(u_j).
-    5. For each skeleton point v_j, find the nearest available treated
-       and control unit in Z-space (without replacement) using adaptive
-       k-NN queries on ``cKDTree`` spatial indices.
+    5. For each skeleton point v_j, find the nearest treated and nearest
+       control unit in Z-space **with replacement** via exact ``cKDTree``
+       nearest-neighbour queries.
 
 **Phase 2 — Cross-fitted DML on the selected original observations**
 
@@ -70,6 +70,9 @@ except ImportError:
     )
 
 import config
+
+# Cache for optimal GLP skeleton U* in [0,1]^q (budgeted search, reusable across calls).
+_UD_SKELETON_CACHE: Dict[Tuple[int, int, int, int], np.ndarray] = {}
 
 # ---------------------------------------------------------------------------
 # Silence non-critical sklearn / lightgbm warnings
@@ -388,8 +391,8 @@ def _fit_propensity_model(
 #   Step 2: Good lattice point skeleton in [0,1]^q, optimised via
 #           mixture discrepancy.
 #   Step 3: Empirical inverse CDF mapping → skeleton in Z-space.
-#   Step 4: Paired nearest-neighbour matching (treated + control)
-#           in Z-space without replacement.
+#   Step 4: Paired exact 1-NN matching (treated + control) in Z-space
+#           with replacement (Algorithm 1).
 #
 
 
@@ -513,17 +516,18 @@ def _map_skeleton_to_rotated_space(
 def _find_admissible_generators(
     r_p: int,
     q: int,
-    max_candidates: int = 200,
+    B_gamma: int,
     rng: Optional[np.random.Generator] = None,
 ) -> list[int]:
-    """Enumerate admissible power generators for the GLP construction.
+    """Enumerate or subsample admissible power generators for the GLP construction.
 
     A positive integer α is *admissible* if gcd(α, r_p + 1) = 1 and the
     remainders  α⁰, α¹, …, α^{q−1}  (mod r_p + 1)  are mutually distinct
     (Section 2.2 of the paper).
 
-    When the number of admissible generators exceeds ``max_candidates``,
-    a random subset is drawn (Section 2.2, paragraph following Eq. for α̂).
+    When the number of admissible generators exceeds ``B_gamma``, a random
+    subset of size ``B_gamma`` is drawn and searched (budgeted quasi-optimal
+    search).
 
     Parameters
     ----------
@@ -531,15 +535,15 @@ def _find_admissible_generators(
         Number of skeleton pairs.
     q : int
         Working dimension (number of retained PCA components).
-    max_candidates : int
-        Maximum number of admissible generators to evaluate.
+    B_gamma : int
+        Maximum number of generator candidates to evaluate (``B_γ``).
     rng : Generator or None
         Random number generator for subset sampling.
 
     Returns
     -------
     list of int
-        Admissible generator values.
+        Admissible generator values (full list or subsample, sorted).
     """
     modulus = r_p + 1
     admissible = []
@@ -547,7 +551,6 @@ def _find_admissible_generators(
     for alpha in range(2, modulus):
         if math.gcd(alpha, modulus) != 1:
             continue
-        # Check that α⁰, α¹, …, α^{q-1} mod (r_p+1) are distinct
         powers = set()
         val = 1
         distinct = True
@@ -561,10 +564,10 @@ def _find_admissible_generators(
         if distinct:
             admissible.append(alpha)
 
-    if len(admissible) > max_candidates:
+    if len(admissible) > B_gamma:
         if rng is None:
             rng = np.random.default_rng(42)
-        chosen = rng.choice(admissible, size=max_candidates, replace=False)
+        chosen = rng.choice(admissible, size=B_gamma, replace=False)
         return sorted(chosen.tolist())
 
     return admissible
@@ -613,6 +616,9 @@ def _construct_glp_design(
     return U
 
 
+_DISCREPANCY_MEM_BUDGET: int = 128 * 1024 * 1024  # ~128 MB per worker
+
+
 def _mixture_discrepancy_squared(U: np.ndarray) -> float:
     """Evaluate the squared mixture discrepancy D²_M of a design in [0,1]^q.
 
@@ -627,6 +633,10 @@ def _mixture_discrepancy_squared(U: np.ndarray) -> float:
 
     A smaller D²_M indicates a more uniformly scattered design.
 
+    The pairwise term (Term 3) is evaluated in row chunks with a
+    per-dimension accumulation loop so that peak memory is bounded by
+    ~``_DISCREPANCY_MEM_BUDGET`` regardless of ``r_p`` and ``q``.
+
     Parameters
     ----------
     U : ndarray of shape (r_p, q)
@@ -639,78 +649,76 @@ def _mixture_discrepancy_squared(U: np.ndarray) -> float:
     """
     r_p, q = U.shape
 
-    # Term 1:  (19/12)^q
+    # Term 1
     term1 = (19.0 / 12.0) ** q
 
-    # Term 2:  −(2/r_p) Σ_j Π_d A₁(u_{jd})
-    #   where A₁(t) = 5/3 − ¼|t − ½| − ¼(t − ½)²
-    centered = U - 0.5                              # shape (r_p, q)
+    # Term 2
+    centered = U - 0.5
     A1_vals = 5.0 / 3.0 - 0.25 * np.abs(centered) - 0.25 * centered ** 2
     term2 = -2.0 / r_p * np.sum(np.prod(A1_vals, axis=1))
 
-    # Term 3:  (1/r_p²) Σ_j Σ_k Π_d k_M(u_{jd}, u_{kd})
-    #   k_M(u,t) = 15/8 − ¼|u−½| − ¼|t−½| − ¾|u−t| + ½(u−t)²
-    #
-    # We vectorise over all (j, k) pairs using broadcasting.
-    abs_centered = np.abs(centered)                 # shape (r_p, q)
-    # Pairwise differences:  shape (r_p, r_p, q)
-    diff = U[:, np.newaxis, :] - U[np.newaxis, :, :]
-    abs_diff = np.abs(diff)
+    # Term 3 — chunked rows × dimension loop to cap memory.
+    # Working arrays per chunk: prod_block(cs, r_p), diff_d(cs, r_p), k_d(cs, r_p)
+    # ≈ 3 × chunk_size × r_p × 8 bytes.
+    abs_centered = np.abs(centered)
+    bytes_per_row = 3 * r_p * 8
+    chunk_size = max(1, min(r_p, _DISCREPANCY_MEM_BUDGET // max(bytes_per_row, 1)))
 
-    kernel = (
-        15.0 / 8.0
-        - 0.25 * abs_centered[:, np.newaxis, :]
-        - 0.25 * abs_centered[np.newaxis, :, :]
-        - 0.75 * abs_diff
-        + 0.5 * diff ** 2
-    )  # shape (r_p, r_p, q)
-    term3 = np.sum(np.prod(kernel, axis=2)) / (r_p ** 2)
+    total = 0.0
+    for i0 in range(0, r_p, chunk_size):
+        i1 = min(i0 + chunk_size, r_p)
+        prod_block = np.ones((i1 - i0, r_p), dtype=np.float64)
+        for d in range(q):
+            u_i = U[i0:i1, d]
+            u_all = U[:, d]
+            diff_d = u_i[:, np.newaxis] - u_all[np.newaxis, :]
+            k_d = (
+                15.0 / 8.0
+                - 0.25 * abs_centered[i0:i1, d, np.newaxis]
+                - 0.25 * abs_centered[:, d][np.newaxis, :]
+                - 0.75 * np.abs(diff_d)
+                + 0.5 * diff_d * diff_d
+            )
+            prod_block *= k_d
+        total += prod_block.sum()
 
+    term3 = total / (r_p * r_p)
     return term1 + term2 + term3
 
 
 def _select_optimal_uniform_design(
     r_p: int,
     q: int,
-    max_candidates: int = 200,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """Select the GLP design with minimum mixture discrepancy (Step 11).
+    B_gamma: int,
+    rng: Optional[np.random.Generator],
+    cache_seed: int,
+) -> Tuple[np.ndarray, bool]:
+    """Select the GLP design with minimum mixture discrepancy (Algorithm 1, Step 11).
 
-    Enumerates admissible power generators, constructs the corresponding
-    candidate designs, evaluates D²_M for each, and returns the design
-    that achieves the minimum.
-
-    If no admissible generators exist (e.g. when q = 1 and r_p + 1 is
-    very small), the function falls back to a centred equispaced grid.
-
-    Parameters
-    ----------
-    r_p : int
-        Number of skeleton pairs.
-    q : int
-        Working dimension.
-    max_candidates : int
-        Maximum number of generator candidates to evaluate.
-    rng : Generator or None
-        Random number generator.
+    Uses skeleton cache keyed by ``(r_p, q, B_gamma, cache_seed)`` so repeated
+    calls with the same design budget reuse the stored optimal ``U*``.
 
     Returns
     -------
     U_best : ndarray of shape (r_p, q)
         Optimal uniform design skeleton in [0, 1]^q.
+    from_cache : bool
+        True if ``U_best`` was retrieved from cache.
     """
-    generators = _find_admissible_generators(r_p, q, max_candidates, rng)
+    key = (int(r_p), int(q), int(B_gamma), int(cache_seed))
+    cached = _UD_SKELETON_CACHE.get(key)
+    if cached is not None:
+        return cached.copy(), True
+
+    generators = _find_admissible_generators(r_p, q, B_gamma, rng)
 
     if not generators:
-        # Fallback: centred equispaced grid (rare edge case)
         j = np.arange(1, r_p + 1, dtype=np.float64)
-        U = np.column_stack([
-            (j - 0.5) / r_p for _ in range(q)
-        ])
-        return U
+        U = np.column_stack([(j - 0.5) / r_p for _ in range(q)])
+        _UD_SKELETON_CACHE[key] = U.copy()
+        return U, False
 
-    best_U = None
+    best_U: Optional[np.ndarray] = None
     best_disc = np.inf
 
     for alpha in generators:
@@ -720,7 +728,9 @@ def _select_optimal_uniform_design(
             best_disc = disc
             best_U = U_candidate
 
-    return best_U
+    assert best_U is not None
+    _UD_SKELETON_CACHE[key] = best_U.copy()
+    return best_U, False
 
 
 # ── Paired Nearest-Neighbour Matching ────────────────────────────────────
@@ -744,51 +754,13 @@ def _build_kdtree(points: np.ndarray) -> cKDTree:
         return cKDTree(points)
 
 
-def _query_nearest_available(
-    tree: cKDTree,
-    used: np.ndarray,
-    point: np.ndarray,
-    initial_k: int,
-) -> int:
-    """Find the nearest *unused* unit via adaptive k-NN expansion.
-
-    Queries the ``initial_k`` nearest neighbours; if all are already
-    claimed, doubles the query size until an available unit is found
-    (Section 2.3, Algorithm 1 Step 16–17).
-
-    Parameters
-    ----------
-    tree : cKDTree
-        Spatial index over the arm's rotated covariates.
-    used : ndarray of bool, shape (n_arm,)
-        Mask of already-selected units.
-    point : ndarray of shape (q,)
-        Query point (skeleton location v_j in Z-space).
-    initial_k : int
-        Starting number of neighbours to query.
-
-    Returns
-    -------
-    int
-        Index into the arm's point array of the nearest available unit.
-
-    Raises
-    ------
-    RuntimeError
-        If no unused units remain.
-    """
-    n_arm = used.size
-    k = min(max(1, initial_k), n_arm)
-    while True:
-        k_query = min(k, n_arm)
-        _, idx = tree.query(point, k=k_query, workers=1)
-        idx = np.atleast_1d(idx)
-        for candidate in idx:
-            if not used[int(candidate)]:
-                return int(candidate)
-        if k_query >= n_arm:
-            raise RuntimeError("All units in this arm have been exhausted.")
-        k = min(n_arm, 2 * k)
+def _kdtree_query_nearest(tree: cKDTree, point: np.ndarray) -> int:
+    """Return index of the exact nearest neighbour (k=1)."""
+    try:
+        _, idx = tree.query(point, k=1, workers=-1)
+    except TypeError:
+        _, idx = tree.query(point, k=1)
+    return int(np.atleast_1d(idx).ravel()[0])
 
 
 # ── Full UD Subsampling Pipeline ─────────────────────────────────────────
@@ -799,45 +771,36 @@ def _select_ud_indices(
     W: np.ndarray,
     r_total: int,
     rng: np.random.Generator,
+    *,
+    B_gamma: Optional[int] = None,
+    cache_seed: int,
+    profile: Optional[Dict[str, float]] = None,
 ) -> np.ndarray:
-    """Execute Phase 1 of Algorithm 1: UD subsampling in PCA-rotated space.
+    """Execute Phase 1 of Algorithm 1: UD subsampling in PCA-rotated Z-space.
 
     Steps:
-        1. Standardise X → X̃.
-        2. PCA on X̃ → retain q dimensions (ρ₀ variance threshold).
-        3. Compute rotated covariates Z = V_q⊤ X̃.
-        4. Construct optimal GLP skeleton U* ⊂ [0,1]^q via mixture
-           discrepancy minimisation.
-        5. Map U* → V (skeleton in Z-space) via marginal empirical
-           inverse CDFs.
-        6. For each v_j, find nearest available treated and control unit
-           in Z-space.
+        1. Standardise X → X̃ (once).
+        2. SVD / PCA: smallest *q* with cumulative variance ≥ ρ₀; Z = X̃ V_q.
+        3. Marginal empirical order statistics of Z (inverse-CDF support).
+        4. GLP / power-generator candidates in [0,1]^q; search all admissible
+           or a random subset of size B_γ; minimise mixture discrepancy D²_M.
+        5. Map skeleton U → V in Z-space via empirical inverse CDF.
+        6. cKDTree on Z for each arm; **with-replacement** 1-NN matching per v_j.
 
     Parameters
     ----------
-    X : ndarray of shape (n, p)
-        Full covariate matrix (original scale).
-    W : ndarray of shape (n,)
-        Binary treatment assignments.
-    r_total : int
-        Desired total subsample size (r = 2 r_p).
-    rng : Generator
-        Numpy random number generator.
-
-    Returns
-    -------
-    selected_indices : ndarray of shape (r,)
-        Indices into the original data arrays (shuffled).
+    profile : dict, optional
+        If provided, cumulative wall times (seconds) are written for keys
+        ``standardize_pca``, ``ecdf_sort``, ``design_search``,
+        ``inverse_cdf_map``, ``kd_build``, ``matching``.
     """
     if r_total <= 0:
         raise ValueError("r_total must be positive for UD subsampling.")
     if r_total > X.shape[0]:
         raise ValueError("r_total cannot exceed population size.")
 
-    treated_mask = W == 1
-    control_mask = W == 0
-    treated_idx = np.where(treated_mask)[0]
-    control_idx = np.where(control_mask)[0]
+    treated_idx = np.where(W == 1)[0]
+    control_idx = np.where(W == 0)[0]
 
     if treated_idx.size == 0 or control_idx.size == 0:
         raise ValueError("UD subsampling requires both treated and control units.")
@@ -846,41 +809,62 @@ def _select_ud_indices(
     if r_p == 0:
         raise ValueError("Insufficient treated/control units for UD subsampling.")
 
-    # ── Step 2–4: Standardise → PCA → rotated covariates ──
+    B = int(B_gamma if B_gamma is not None else getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30))
+
+    if profile is not None:
+        for k in (
+            "standardize_pca",
+            "ecdf_sort",
+            "design_search",
+            "inverse_cdf_map",
+            "kd_build",
+            "matching",
+        ):
+            profile.setdefault(k, 0.0)
+
+    t0 = time.perf_counter()
     rho_0 = getattr(config, "UD_VARIANCE_THRESHOLD", 0.85)
     X_tilde = _standardise_covariates(X.astype(np.float64))
     Z_all, _V_q, q = _pca_rotate(X_tilde, rho_0)
+    if profile is not None:
+        profile["standardize_pca"] += time.perf_counter() - t0
 
-    # ── Step 6–11: Construct optimal GLP uniform design ──
-    max_cand = getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 200)
-    U_skeleton = _select_optimal_uniform_design(r_p, q, max_cand, rng)
-
-    # ── Step 12: Map skeleton to rotated space via empirical inverse CDF ──
+    t1 = time.perf_counter()
     Z_sorted = _marginal_empirical_cdf_ranks(Z_all)
-    V_skeleton = _map_skeleton_to_rotated_space(U_skeleton, Z_sorted)
+    if profile is not None:
+        profile["ecdf_sort"] += time.perf_counter() - t1
 
-    # ── Step 13–19: Paired nearest-neighbour matching in Z-space ──
-    initial_k = getattr(config, "UD_NEAREST_NEIGHBORS", 5)
+    t2 = time.perf_counter()
+    U_skeleton, _from_cache = _select_optimal_uniform_design(
+        r_p, q, B, rng, int(cache_seed),
+    )
+    if profile is not None:
+        profile["design_search"] += time.perf_counter() - t2
+
+    t3 = time.perf_counter()
+    V_skeleton = _map_skeleton_to_rotated_space(U_skeleton, Z_sorted)
+    if profile is not None:
+        profile["inverse_cdf_map"] += time.perf_counter() - t3
+
+    t4 = time.perf_counter()
     Z_treated = Z_all[treated_idx]
     Z_control = Z_all[control_idx]
-
     tree_treated = _build_kdtree(Z_treated)
     tree_control = _build_kdtree(Z_control)
+    if profile is not None:
+        profile["kd_build"] += time.perf_counter() - t4
 
-    used_treated = np.zeros(treated_idx.size, dtype=bool)
-    used_control = np.zeros(control_idx.size, dtype=bool)
-
+    t5 = time.perf_counter()
     selected_treated = np.empty(r_p, dtype=np.intp)
     selected_control = np.empty(r_p, dtype=np.intp)
-
     for j in range(r_p):
         v_j = V_skeleton[j]
-        t_local = _query_nearest_available(tree_treated, used_treated, v_j, initial_k)
-        c_local = _query_nearest_available(tree_control, used_control, v_j, initial_k)
-        used_treated[t_local] = True
-        used_control[c_local] = True
+        t_local = _kdtree_query_nearest(tree_treated, v_j)
+        c_local = _kdtree_query_nearest(tree_control, v_j)
         selected_treated[j] = treated_idx[t_local]
         selected_control[j] = control_idx[c_local]
+    if profile is not None:
+        profile["matching"] += time.perf_counter() - t5
 
     combined = np.concatenate([selected_treated, selected_control])
     rng.shuffle(combined)
@@ -1025,6 +1009,7 @@ def run_ud(
     is_rct: bool,
     r: Dict[str, int],
     k_folds: int = 2,
+    return_profile: bool = False,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Uniform Design subsampling + DML (proposed UD-DML estimator).
@@ -1041,51 +1026,94 @@ def run_ud(
         See ``run_full``.
     r : dict
         Must contain ``'r_total'`` (desired total subsample size = 2 r_p).
+    return_profile : bool
+        If True, include ``time_breakdown`` with per-phase wall times (seconds).
     **kwargs
-        ``sim_seed``, ``misspecification``, ``learner``, ``store_sample``.
+        ``sim_seed``, ``misspecification``, ``learner``, ``store_sample``,
+        ``B_gamma`` (optional override for ``UD_MAX_GENERATOR_CANDIDATES``).
 
     Returns
     -------
     dict
         Same keys as ``run_full`` plus ``subsample_projection``,
-        ``subsample_indices``.
+        ``subsample_indices``.  If ``return_profile`` is True, also
+        ``time_breakdown`` with keys ``standardize_pca``, ``ecdf_sort``,
+        ``design_search``, ``inverse_cdf_map``, ``kd_build``, ``matching``,
+        ``dml``, ``inference``, ``total``.
     """
-    start = time.time()
+    t_wall0 = time.perf_counter()
+    phase1_prof: Optional[Dict[str, float]] = {} if return_profile else None
+
     r_total = int(r["r_total"])
     if r_total <= 0:
         raise ValueError("r_total must be positive for UD-DML.")
     r_total = min(r_total, X.shape[0])
 
-    sim_seed = kwargs.get("sim_seed", config.BASE_SEED)
+    sim_seed = int(kwargs.get("sim_seed", config.BASE_SEED))
     rng = np.random.default_rng(sim_seed + 31)
+    cache_seed = sim_seed + 31
 
-    # Phase 1: UD subsampling
-    subsample_idx = _select_ud_indices(X, W, r_total, rng)
+    B_gamma = kwargs.get("B_gamma")
+    if B_gamma is not None:
+        B_gamma = int(B_gamma)
+
+    subsample_idx = _select_ud_indices(
+        X,
+        W,
+        r_total,
+        rng,
+        B_gamma=B_gamma,
+        cache_seed=cache_seed,
+        profile=phase1_prof,
+    )
     unique_count = int(np.unique(subsample_idx).size)
 
-    # Phase 2: Cross-fitted DML on selected original observations
     X_sub, W_sub, Y_sub = X[subsample_idx], W[subsample_idx], Y_obs[subsample_idx]
     pi_val = float(pi_true) if np.isscalar(pi_true) else float(np.mean(pi_true))
     learner = kwargs.get("learner", getattr(config, "DEFAULT_NUISANCE_LEARNER", "lgbm"))
 
+    t_dml0 = time.perf_counter()
     mu0, mu1, e = _fit_nuisance_models(
-        X_sub, W_sub, Y_sub, k_folds, is_rct, pi_val,
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        pi_val,
         misspecification=kwargs.get("misspecification"),
         learner=learner,
     )
     scores = _aipw_score(Y_sub, W_sub, mu0, mu1, e)
+    t_dml1 = time.perf_counter()
 
-    # Phase 3: Estimation and inference
+    t_inf0 = time.perf_counter()
     est_ate, ci_lower, ci_upper = _wald_inference(scores)
+    t_inf1 = time.perf_counter()
 
-    return {
+    total_time = time.perf_counter() - t_wall0
+
+    out: Dict[str, Any] = {
         "est_ate": est_ate,
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
-        "runtime": time.time() - start,
+        "runtime": total_time,
         "subsample_size": len(subsample_idx),
         "subsample_unique": unique_count,
         "learner": learner,
         "subsample_projection": X_sub[:, :2].copy() if kwargs.get("store_sample") else None,
         "subsample_indices": subsample_idx.tolist(),
     }
+    if return_profile:
+        assert phase1_prof is not None
+        out["time_breakdown"] = {
+            "standardize_pca": phase1_prof["standardize_pca"],
+            "ecdf_sort": phase1_prof["ecdf_sort"],
+            "design_search": phase1_prof["design_search"],
+            "inverse_cdf_map": phase1_prof["inverse_cdf_map"],
+            "kd_build": phase1_prof["kd_build"],
+            "matching": phase1_prof["matching"],
+            "dml": t_dml1 - t_dml0,
+            "inference": t_inf1 - t_inf0,
+            "total": total_time,
+        }
+    return out
