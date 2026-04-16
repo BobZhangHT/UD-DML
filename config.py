@@ -16,6 +16,8 @@ a single edit propagates globally.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from data_generation import (
@@ -35,7 +37,7 @@ import methods
 BASE_SEED: int = 20250919
 """Master random seed for reproducibility across all experiments."""
 
-DEFAULT_REPLICATIONS: int = 1000
+DEFAULT_REPLICATIONS: int = 500
 """Number of Monte Carlo replications per experiment variant."""
 
 N_POPULATION: int = 500_000
@@ -44,8 +46,14 @@ N_POPULATION: int = 500_000
 K_FOLDS: int = 2
 """Number of cross-fitting folds for DML (Section 3.2)."""
 
-MAX_PARALLEL_JOBS: int = 16
-"""Upper bound on the number of cores used for outer parallelism."""
+MAX_PARALLEL_JOBS: int = 32
+"""Upper bound on the number of cores used for outer parallelism.
+
+Tuned for the 32 vCPU AMD EPYC 9654 / 60 GB RAM server.  Override at
+runtime via env ``OS_DML_MAX_JOBS`` (e.g. when running on a laptop).
+Each worker uses ~1-2 GB for n=5e5 replications, so 32 workers fit
+comfortably into 60 GB with LGBM/DML overhead.
+"""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 2. UD-DML Subsampling Configuration (Algorithm 1)
@@ -70,6 +78,17 @@ UD_NEAREST_NEIGHBORS: int = 5
 
 The main UD-DML path uses exact 1-NN matching *with* replacement in Z-space
 (Algorithm 1); this key is not used by ``methods.run_ud``.
+"""
+
+UD_SKELETON_DISK_CACHE_DIR: Path | None = Path("ud_skeleton_cache")
+"""Persist GLP uniform-design skeletons ``U*`` for reuse across processes/runs.
+
+Files are keyed by ``(r_p, q, B_gamma, cache_seed)`` and are bitwise-identical
+to the in-memory cache in ``methods``. Set to ``None`` to disable unless the
+environment variable ``UD_SKELETON_DISK_CACHE`` overrides (see ``methods``).
+
+The first run populates this directory; later runs and parallel workers load
+from disk when the in-process cache misses (typical under ``joblib``).
 """
 
 # ═══════════════════════════════════════════════════════════════════════════

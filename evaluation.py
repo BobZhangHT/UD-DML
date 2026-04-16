@@ -62,15 +62,10 @@ METHOD_LEARNER_MARKERS = {
 LEARNER_LIGHTNESS_SHIFT = {"lasso_cv": -0.08, "rf": 0.0, "lgbm": 0.08}
 DEFAULT_FIGURE_DPI = 400
 BASE_FONT_SIZE = 12
-plt.rcParams.update(
-    {
-        "axes.titlesize": BASE_FONT_SIZE + 2,
-        "axes.labelsize": BASE_FONT_SIZE,
-        "xtick.labelsize": BASE_FONT_SIZE,
-        "ytick.labelsize": BASE_FONT_SIZE,
-        "legend.fontsize": BASE_FONT_SIZE,
-    }
-)
+# NB: publication-quality rcParams are applied globally in simulations.py
+# (bold serif, larger titles/labels/legend).  We intentionally do NOT
+# override them here so evaluation.py figures inherit the same style.
+# BASE_FONT_SIZE is still used below for explicit ``fontsize=`` kwargs.
 
 # =============================================================================
 # Helper utilities
@@ -918,11 +913,15 @@ def _population_size_reports(
         fig.legend(
             handles=handles,
             loc="upper center",
-            bbox_to_anchor=(0.5, 0.98),
+            bbox_to_anchor=(0.5, 1.0),
             ncol=max(1, len(handles)),
-            frameon=False,
+            frameon=True,
+            framealpha=0.9,
+            edgecolor="0.4",
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        # Reserve the top 8 % of canvas for the figure legend so it never
+        # overlaps the first row of subplot titles / curves.
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
         _save_figure_multi_format(fig, figures_dir / f"population_metrics_r{int(r_total)}")
 
 
@@ -1389,19 +1388,28 @@ def _nuisance_sensitivity_reports(
                 )
                 legend_handles.append(patch)
         
-        # Add title first, then legend below it
-        fig.suptitle(f"Learner Sensitivity ({scenario})", fontsize=BASE_FONT_SIZE + 4, y=0.98)
-        
+        # Title on top; legend below the whole figure (keeps it out of
+        # the subplot titles / bars).  ``rect`` reserves 8 % top + 10 %
+        # bottom so neither overlaps the panels.
+        fig.suptitle(
+            f"Learner Sensitivity ({scenario})",
+            fontsize=BASE_FONT_SIZE + 6,
+            fontweight="bold",
+            y=0.99,
+        )
+
         if legend_handles:
             fig.legend(
                 handles=legend_handles,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 0.94),
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.0),
                 ncol=min(6, len(legend_handles)),
-                frameon=False,
+                frameon=True,
+                framealpha=0.9,
+                edgecolor="0.4",
             )
-        
-        fig.tight_layout(rect=[0, 0, 1, 0.90])
+
+        fig.tight_layout(rect=[0, 0.08, 1, 0.94])
         _save_figure_multi_format(fig, figures_dir / f"nuisance_sensitivity_{scenario}")
 
 # =============================================================================

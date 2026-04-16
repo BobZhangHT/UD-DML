@@ -46,8 +46,12 @@ Algorithm overview (UD-DML)
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import time
 import warnings
+import zlib
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -73,6 +77,80 @@ import config
 
 # Cache for optimal GLP skeleton U* in [0,1]^q (budgeted search, reusable across calls).
 _UD_SKELETON_CACHE: Dict[Tuple[int, int, int, int], np.ndarray] = {}
+
+# ---------------------------------------------------------------------------
+# Optional compiled C backend for the GLP search.  Enabled by default when
+# ``genUD.dll`` / ``libgenUD.so`` is present next to this file; falls back
+# transparently to the pure-Python loop if the library cannot be loaded, or
+# if the user opts out via ``UD_USE_C_BACKEND=0``.
+# ---------------------------------------------------------------------------
+_UD_USE_C_ENV = os.environ.get("UD_USE_C_BACKEND", "").strip().lower()
+_UD_C_DISABLED = _UD_USE_C_ENV in ("0", "false", "off", "no")
+
+try:
+    import genUD_wrapper as _genUD  # noqa: E402
+
+    _UD_C_AVAILABLE = (not _UD_C_DISABLED) and _genUD.c_genUD_available()
+except Exception as _ud_c_exc:  # pragma: no cover — graceful fallback
+    _genUD = None  # type: ignore[assignment]
+    _UD_C_AVAILABLE = False
+
+
+def ud_c_backend_active() -> bool:
+    """Return True iff the compiled C backend is loaded and enabled."""
+    return bool(_UD_C_AVAILABLE)
+
+
+def _ud_skeleton_disk_cache_root() -> Optional[Path]:
+    """Resolve optional on-disk skeleton store (see ``config.UD_SKELETON_DISK_CACHE_DIR``).
+
+    Environment ``UD_SKELETON_DISK_CACHE`` overrides the config directory when set
+    to a non-empty path; values ``0`` / ``false`` / ``off`` / ``none`` disable.
+    """
+    env = os.environ.get("UD_SKELETON_DISK_CACHE")
+    if env is not None:
+        s = env.strip()
+        if s.lower() in ("0", "false", "off", "none", ""):
+            return None
+        return Path(s).expanduser().resolve()
+    root = getattr(config, "UD_SKELETON_DISK_CACHE_DIR", None)
+    if root is None:
+        return None
+    return Path(root).expanduser().resolve()
+
+
+def _ud_skeleton_disk_path(root: Path, key: Tuple[int, int, int, int]) -> Path:
+    r_p, q, B_gamma, cache_seed = key
+    name = f"ud_r{r_p}_q{q}_Bg{B_gamma}_seed{cache_seed}.npy"
+    return root / name
+
+
+def _try_load_ud_skeleton_npy(path: Path, r_p: int, q: int) -> Optional[np.ndarray]:
+    if not path.is_file():
+        return None
+    try:
+        U = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(U, np.ndarray) or U.shape != (r_p, q):
+        return None
+    return U.astype(np.float64, copy=False)
+
+
+def _atomic_save_ud_skeleton_npy(path: Path, U: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".npy", dir=str(path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp)
+    try:
+        np.save(tmp_path, U.astype(np.float64, copy=False), allow_pickle=False)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 # ---------------------------------------------------------------------------
 # Silence non-critical sklearn / lightgbm warnings
@@ -696,7 +774,10 @@ def _select_optimal_uniform_design(
     """Select the GLP design with minimum mixture discrepancy (Algorithm 1, Step 11).
 
     Uses skeleton cache keyed by ``(r_p, q, B_gamma, cache_seed)`` so repeated
-    calls with the same design budget reuse the stored optimal ``U*``.
+    calls with the same design budget reuse the stored optimal ``U*``. When
+    ``config.UD_SKELETON_DISK_CACHE_DIR`` (or env ``UD_SKELETON_DISK_CACHE``) is
+    set, entries are also read/written as ``.npy`` files so ``joblib`` workers
+    and later processes avoid repeating the GLP search.
 
     Returns
     -------
@@ -710,27 +791,91 @@ def _select_optimal_uniform_design(
     if cached is not None:
         return cached.copy(), True
 
+    disk_root = _ud_skeleton_disk_cache_root()
+    disk_path = _ud_skeleton_disk_path(disk_root, key) if disk_root is not None else None
+    if disk_path is not None:
+        loaded = _try_load_ud_skeleton_npy(disk_path, r_p, q)
+        if loaded is not None:
+            U_mem = loaded.copy()
+            _UD_SKELETON_CACHE[key] = U_mem
+            return U_mem.copy(), True
+
     generators = _find_admissible_generators(r_p, q, B_gamma, rng)
 
     if not generators:
         j = np.arange(1, r_p + 1, dtype=np.float64)
         U = np.column_stack([(j - 0.5) / r_p for _ in range(q)])
         _UD_SKELETON_CACHE[key] = U.copy()
+        if disk_path is not None:
+            _atomic_save_ud_skeleton_npy(disk_path, U)
         return U, False
 
     best_U: Optional[np.ndarray] = None
     best_disc = np.inf
 
-    for alpha in generators:
-        U_candidate = _construct_glp_design(r_p, q, alpha)
-        disc = _mixture_discrepancy_squared(U_candidate)
-        if disc < best_disc:
-            best_disc = disc
-            best_U = U_candidate
+    if _UD_C_AVAILABLE:
+        # Delegate the hot loop (GLP construction + D^2_M scan over all
+        # enumerated generators) to the compiled C routine.  The candidate
+        # set is identical to the Python baseline, so results match up to
+        # floating-point rounding in the pairwise sum (< 1e-10 relative).
+        try:
+            best_U, _best_alpha, best_disc = _genUD.c_genUD_search(
+                generators, r_p, q,
+            )
+        except Exception:  # pragma: no cover — fall back transparently
+            best_U = None
+
+    if best_U is None:
+        for alpha in generators:
+            U_candidate = _construct_glp_design(r_p, q, alpha)
+            disc = _mixture_discrepancy_squared(U_candidate)
+            if disc < best_disc:
+                best_disc = disc
+                best_U = U_candidate
 
     assert best_U is not None
     _UD_SKELETON_CACHE[key] = best_U.copy()
+    if disk_path is not None:
+        _atomic_save_ud_skeleton_npy(disk_path, best_U)
     return best_U, False
+
+
+def get_ud_cache_seed(
+    r_total: int,
+    *,
+    scenario_name: Optional[str] = None,
+    population_size: Optional[int] = None,
+    B_gamma: Optional[int] = None,
+) -> int:
+    """Return a stable cache seed for UD skeleton reuse across replications.
+
+    The GLP skeleton depends on ``(r_p, q, B_gamma)`` plus the random subset
+    choice inside the admissible-generator budgeted search. That subset should
+    be fixed for a given experiment setting, not per Monte Carlo replication,
+    otherwise repeated runs cannot reuse the same cached skeleton.
+    """
+    parts = [
+        str(int(r_total)),
+        str(int(population_size)) if population_size is not None else "default",
+        str(int(B_gamma)) if B_gamma is not None else "default",
+        scenario_name or "global",
+    ]
+    payload = "|".join(parts).encode("utf-8", errors="strict")
+    # Fixed 32-bit seed derived from experiment settings only.
+    return int(zlib.adler32(payload) & 0x7FFFFFFF) + 1
+
+
+def warm_start_ud_skeleton(
+    r_p: int,
+    q: int,
+    *,
+    B_gamma: Optional[int] = None,
+    cache_seed: int,
+) -> Tuple[np.ndarray, bool]:
+    """Ensure the UD skeleton for ``(r_p, q, B_gamma, cache_seed)`` is cached."""
+    B = int(B_gamma if B_gamma is not None else getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30))
+    rng = np.random.default_rng(int(cache_seed))
+    return _select_optimal_uniform_design(int(r_p), int(q), B, rng, int(cache_seed))
 
 
 # ── Paired Nearest-Neighbour Matching ────────────────────────────────────
@@ -757,7 +902,8 @@ def _build_kdtree(points: np.ndarray) -> cKDTree:
 def _kdtree_query_nearest(tree: cKDTree, point: np.ndarray) -> int:
     """Return index of the exact nearest neighbour (k=1)."""
     try:
-        _, idx = tree.query(point, k=1, workers=-1)
+        # workers=1: avoid nested thread pools under joblib process parallelism (UD matching loop).
+        _, idx = tree.query(point, k=1, workers=1)
     except TypeError:
         _, idx = tree.query(point, k=1)
     return int(np.atleast_1d(idx).ravel()[0])
@@ -1051,11 +1197,18 @@ def run_ud(
 
     sim_seed = int(kwargs.get("sim_seed", config.BASE_SEED))
     rng = np.random.default_rng(sim_seed + 31)
-    cache_seed = sim_seed + 31
-
     B_gamma = kwargs.get("B_gamma")
     if B_gamma is not None:
         B_gamma = int(B_gamma)
+    cache_seed = kwargs.get("cache_seed")
+    if cache_seed is None:
+        cache_seed = get_ud_cache_seed(
+            r_total,
+            scenario_name=kwargs.get("scenario_name"),
+            population_size=kwargs.get("population_size"),
+            B_gamma=B_gamma,
+        )
+    cache_seed = int(cache_seed)
 
     subsample_idx = _select_ud_indices(
         X,

@@ -10,6 +10,7 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.claude
 
 *.pdf
 
@@ -20,6 +21,11 @@ __pycache__/
 # Simulation and Analysis Results
 simulation_results/
 analysis_results/
+
+# UD GLP skeleton disk cache (regenerable)
+ud_bench_cache/
+ud_skeleton_cache/
+test/
 
 # OS files
 .DS_Store
