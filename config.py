@@ -24,9 +24,7 @@ from data_generation import (
     generate_obs_1_data,
     generate_obs_2_data,
     generate_obs_3_data,
-    generate_rct_1_data,
-    generate_rct_2_data,
-    generate_rct_3_data,
+    generate_obs_3_overlap_data,
 )
 import methods
 
@@ -152,6 +150,13 @@ ROBUSTNESS_MISSPECIFICATIONS: list[str] = [
 ]
 """Nuisance model specification scenarios (Section 3.3, Experiment 3)."""
 
+OVERLAP_STRENGTH_GRID: list[float] = [0.1, 0.3, 0.5, 0.7, 1.0, 1.5]
+"""Propensity coefficient multiplier c for the overlap gradient experiment.
+
+logit(e(X)) = c · (0.3·X₁ + 0.3·X₂ − 0.5·X₆).  Higher c → worse overlap.
+c=0.5 reproduces the default OBS-3; c=1.5 creates near-zero overlap.
+"""
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Scenario and Experiment Definitions
@@ -174,25 +179,8 @@ def get_experiments():
         methods, output directory, and parameter grid for each experiment.
     """
 
+    # Only observational scenarios — RCTs removed per paper scope.
     scenarios = {
-        "RCT-1": {
-            "data_gen_func": generate_rct_1_data,
-            "params": {"n": N_POPULATION, "p": 10},
-            "design": "rct",
-            "covariates": "x1",
-        },
-        "RCT-2": {
-            "data_gen_func": generate_rct_2_data,
-            "params": {"n": N_POPULATION, "p": 10},
-            "design": "rct",
-            "covariates": "x2",
-        },
-        "RCT-3": {
-            "data_gen_func": generate_rct_3_data,
-            "params": {"n": N_POPULATION, "p": 10},
-            "design": "rct",
-            "covariates": "x3",
-        },
         "OBS-1": {
             "data_gen_func": generate_obs_1_data,
             "params": {"n": N_POPULATION, "p": 10},
@@ -211,6 +199,12 @@ def get_experiments():
             "design": "obs",
             "covariates": "x3",
         },
+        "OBS-3-overlap": {
+            "data_gen_func": generate_obs_3_overlap_data,
+            "params": {"n": N_POPULATION, "p": 10, "overlap_strength": 1.0},
+            "design": "obs",
+            "covariates": "x3",
+        },
     }
 
     all_methods = {
@@ -220,24 +214,11 @@ def get_experiments():
     }
 
     experiments = {
-        "experiment_visualization": {
-            "description": "2-D covariate coverage diagnostics for UD-DML vs UNIF.",
-            "scenarios": list(scenarios.keys()),
-            "methods": ["UD", "UNIF"],
-            "base_dir": "./simulation_results/visualization",
-            "params": {
-                "r_total": 500,
-                "population_size": 100_000,
-                "store_sample": True,
-                "n_estimators": LGBM_N_ESTIMATORS,
-                "k_folds": K_FOLDS,
-                "n_replications": 1,
-            },
-        },
+        # ── Exp 1: Statistical efficiency vs subsample budget r ──
         "experiment_subsample_size": {
             "description": (
-                "RMSE / coverage across subsample sizes for all six DGPs "
-                "(Section 3.3, Experiment 1)."
+                "RMSE / CI coverage / CI width across subsample sizes r "
+                "for all three OBS scenarios (Paper Figure 1)."
             ),
             "scenarios": list(scenarios.keys()),
             "methods": ["UD", "UNIF"],
@@ -250,10 +231,47 @@ def get_experiments():
                 "n_replications": DEFAULT_REPLICATIONS,
             },
         },
+        # ── Exp 2: Overlap gradient — how advantage scales with overlap severity ──
+        "experiment_overlap_gradient": {
+            "description": (
+                "Overlap gradient: RMSE and CI metrics as a function of "
+                "propensity coefficient strength c (Paper Figure 2 + Table 1)."
+            ),
+            "scenarios": ["OBS-3-overlap"],
+            "methods": ["UD", "UNIF"],
+            "base_dir": "./simulation_results/overlap_gradient",
+            "params": {
+                "overlap_strengths": OVERLAP_STRENGTH_GRID,
+                "r_total": 5_000,
+                "population_size": N_POPULATION,
+                "n_estimators": LGBM_N_ESTIMATORS,
+                "k_folds": K_FOLDS,
+                "n_replications": DEFAULT_REPLICATIONS,
+            },
+        },
+        # ── Exp 3: Double-robustness stress test ──
+        "experiment_double_robust": {
+            "description": (
+                "Double-robustness stress test under nuisance misspecification "
+                "(Paper Table 2)."
+            ),
+            "scenarios": list(scenarios.keys()),
+            "methods": ["UD", "UNIF"],
+            "base_dir": "./simulation_results/double_robustness",
+            "params": {
+                "misspecification_scenarios": ROBUSTNESS_MISSPECIFICATIONS,
+                "r_total": 5_000,
+                "population_size": N_POPULATION,
+                "n_estimators": LGBM_N_ESTIMATORS,
+                "k_folds": K_FOLDS,
+                "n_replications": DEFAULT_REPLICATIONS,
+            },
+        },
+        # ── Exp 4: Scalability with population n + bias-variance decomposition ──
         "experiment_population_size": {
             "description": (
-                "Scalability: effect of full-data size n on estimation accuracy "
-                "for low / high UD budgets (Section 3.3, Experiment 2)."
+                "Scalability: effect of n on estimation accuracy for low/high "
+                "subsample budgets, with bias-variance decomposition (Paper Table 3)."
             ),
             "scenarios": list(scenarios.keys()),
             "methods": ["UD", "UNIF", "FULL"],
@@ -266,38 +284,24 @@ def get_experiments():
                 "n_replications": DEFAULT_REPLICATIONS,
             },
         },
-        "experiment_double_robust": {
+        # ── Exp 5: Asymptotic normality + covariate balance (post-process) ──
+        # Uses raw results from Exp 1 (r=5000, OBS-3). No extra simulation needed.
+        # Generates: Q-Q normality plot (Figure 3), SMD love plot (Figure 4).
+        "experiment_visualization": {
             "description": (
-                "Double-robustness stress test for observational scenarios "
-                "(Section 3.3, Experiment 3)."
+                "Propensity density, Q-Q normality, and SMD love plot "
+                "diagnostics (Paper Figures 3-4). Single rep for propensity viz."
             ),
-            "scenarios": ["OBS-1", "OBS-2", "OBS-3"],
+            "scenarios": list(scenarios.keys()),
             "methods": ["UD", "UNIF"],
-            "base_dir": "./simulation_results/double_robustness",
+            "base_dir": "./simulation_results/visualization",
             "params": {
-                "misspecification_scenarios": ROBUSTNESS_MISSPECIFICATIONS,
                 "r_total": 5_000,
                 "population_size": N_POPULATION,
+                "store_sample": True,
                 "n_estimators": LGBM_N_ESTIMATORS,
                 "k_folds": K_FOLDS,
-                "n_replications": DEFAULT_REPLICATIONS,
-            },
-        },
-        "experiment_nuisance_sensitivity": {
-            "description": (
-                "Learner sensitivity: LGBM vs RF vs LASSO on OBS-3 "
-                "(Section 3.3, Experiment 4)."
-            ),
-            "scenarios": ["OBS-3"],
-            "methods": ["UD", "UNIF"],
-            "base_dir": "./simulation_results/nuisance_sensitivity",
-            "params": {
-                "r_totals": SUBSAMPLE_TOTALS,
-                "population_size": N_POPULATION,
-                "nuisance_learners": ["lasso_cv", "rf", "lgbm"],
-                "n_estimators": LGBM_N_ESTIMATORS,
-                "k_folds": K_FOLDS,
-                "n_replications": DEFAULT_REPLICATIONS,
+                "n_replications": 1,
             },
         },
     }

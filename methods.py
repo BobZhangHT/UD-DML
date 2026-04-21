@@ -78,6 +78,11 @@ import config
 # Cache for optimal GLP skeleton U* in [0,1]^q (budgeted search, reusable across calls).
 _UD_SKELETON_CACHE: Dict[Tuple[int, int, int, int], np.ndarray] = {}
 
+# Per-worker LRU (size 1) for UD-selected indices.  Keyed by Python id(X, W)
+# plus subsampling parameters.  Saves ~1-2 s per call on n=5e5 when multiple
+# tasks (e.g. 4 misspec variants in double_robust) share the same DGP sample.
+_UD_INDICES_CACHE: Optional[Tuple[Tuple, np.ndarray]] = None
+
 # ---------------------------------------------------------------------------
 # Optional compiled C backend for the GLP search.  Enabled by default when
 # ``genUD.dll`` / ``libgenUD.so`` is present next to this file; falls back
@@ -332,15 +337,23 @@ def _fit_outcome_models(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Fit and predict conditional outcome models m̂₀(x) and m̂₁(x).
 
-    Under misspecification ``'wrong_correct'`` or ``'wrong_wrong'``, the
-    outcome models are replaced by linear regressions on the first two
-    covariates only (Section 3.3, Experiment 3).
+    Unified misspecification scheme for the Section 3.3 double-robustness
+    experiment: whenever the outcome model is marked as ``wrong``
+    (both in ``'wrong_correct'`` and in ``'wrong_wrong'``) we use the
+    same wrong specification, namely *arm-specific linear regression of
+    Y on the single covariate X^{(5)}*.  X^{(5)} enters neither the
+    outcome mechanism g nor the CATE Δ nor the propensity e of any of
+    OBS-1, OBS-2, or OBS-3, so this amounts to an arm-specific
+    intercept-only model with a spurious regressor.  Under (wrong,
+    correct), DR is preserved via the propensity path; under (wrong,
+    wrong), AIPW collapses to the subsample difference-in-means.
     """
     if misspecification in ("wrong_correct", "wrong_wrong"):
         from sklearn.linear_model import LinearRegression
-        lr0 = LinearRegression().fit(X_tr[W_tr == 0, :2], Y_tr[W_tr == 0])
-        lr1 = LinearRegression().fit(X_tr[W_tr == 1, :2], Y_tr[W_tr == 1])
-        return lr0.predict(X_te[:, :2]), lr1.predict(X_te[:, :2])
+        idx = [4]  # X^{(5)}: never used in any DGP's outcome or propensity
+        lr0 = LinearRegression().fit(X_tr[W_tr == 0][:, idx], Y_tr[W_tr == 0])
+        lr1 = LinearRegression().fit(X_tr[W_tr == 1][:, idx], Y_tr[W_tr == 1])
+        return lr0.predict(X_te[:, idx]), lr1.predict(X_te[:, idx])
 
     return _fit_outcome_pair(X_tr, Y_tr, W_tr, X_te, learner)
 
@@ -410,11 +423,23 @@ def _fit_propensity_model(
     learner: str,
     misspecification: Optional[str],
 ) -> np.ndarray:
-    """Fit and predict the propensity score ê(x) = P̂(W=1|X=x)."""
+    """Fit and predict the propensity score ê(x) = P̂(W=1|X=x).
+
+    Unified misspecification scheme for the Section 3.3 double-robustness
+    experiment: whenever the propensity model is marked as ``wrong``
+    (both in ``'correct_wrong'`` and in ``'wrong_wrong'``) we use the
+    same wrong specification, namely *logistic regression of W on the
+    single covariate X^{(5)}*.  X^{(5)} enters no DGP's propensity, so
+    this reduces to a near-constant fit at the marginal treatment rate.
+    Under (correct, wrong), DR is preserved via the correctly specified
+    outcome path; under (wrong, wrong), AIPW collapses to the subsample
+    difference-in-means.
+    """
     if misspecification in ("correct_wrong", "wrong_wrong"):
+        idx = [4]  # X^{(5)}: never used in any DGP's propensity
         lr = LogisticRegression(solver="liblinear", max_iter=1000)
-        lr.fit(X_tr[:, :2], W_tr)
-        return lr.predict_proba(X_te[:, :2])[:, 1]
+        lr.fit(X_tr[:, idx], W_tr)
+        return lr.predict_proba(X_te[:, idx])[:, 1]
 
     if learner == "rf":
         clf = RandomForestClassifier(
@@ -523,19 +548,33 @@ def _pca_rotate(
         Number of retained components.
     """
     n, p = X_tilde.shape
-    # economy SVD — only the first min(n, p) components
-    _, S, Vt = np.linalg.svd(X_tilde, full_matrices=False)
+    # Fast path for n >> p (typical for real-data application): eigendecompose
+    # the p×p sample covariance.  np.linalg.svd on (n, p) is dominated by an
+    # internal QR + bidiagonalisation that scales poorly in n; the eigh route
+    # is O(n·p²) for the gram and O(p³) for eigendecomp, ~10× faster at
+    # n=2.8M, p=10.
+    if p <= 50:
+        gram = X_tilde.T @ X_tilde                    # (p, p)
+        eigvals, eigvecs = np.linalg.eigh(gram)       # ascending
+        order = np.argsort(eigvals)[::-1]
+        eigvals = np.maximum(eigvals[order], 0.0)
+        eigvecs = eigvecs[:, order]
+        total = max(eigvals.sum(), 1e-12)
+        cumulative_ratio = np.cumsum(eigvals) / total
+        q = int(np.searchsorted(cumulative_ratio, rho_0) + 1)
+        q = min(q, p)
+        V_q = eigvecs[:, :q]
+        Z = X_tilde @ V_q
+        return Z, V_q, q
 
-    # Squared singular values are proportional to variance
+    # Fallback: economy SVD for large p.
+    _, S, Vt = np.linalg.svd(X_tilde, full_matrices=False)
     var_explained = S ** 2
     cumulative_ratio = np.cumsum(var_explained) / var_explained.sum()
-
-    # Smallest q such that cumulative_ratio[q-1] >= rho_0
     q = int(np.searchsorted(cumulative_ratio, rho_0) + 1)
-    q = min(q, p)  # cannot exceed p
-
-    V_q = Vt[:q, :].T                     # shape (p, q)
-    Z = X_tilde @ V_q                     # shape (n, q)
+    q = min(q, p)
+    V_q = Vt[:q, :].T
+    Z = X_tilde @ V_q
     return Z, V_q, q
 
 
@@ -884,17 +923,19 @@ def warm_start_ud_skeleton(
 def _build_kdtree(points: np.ndarray) -> cKDTree:
     """Build a cKDTree spatial index for nearest-neighbour queries.
 
-    Parameters
-    ----------
-    points : ndarray of shape (m, q)
-        Points to index (rotated covariates for one treatment arm).
-
-    Returns
-    -------
-    cKDTree
+    Tuned for very large arms (n ~ 1e6+): a larger leafsize plus
+    ``balanced_tree=False`` and ``compact_nodes=False`` cuts construction
+    time roughly 3-4× versus scipy defaults at the cost of a small
+    increase in per-query depth — favourable when r_p << n.
     """
     try:
-        return cKDTree(points, copy_data=False)
+        return cKDTree(
+            points,
+            leafsize=32,
+            balanced_tree=False,
+            compact_nodes=False,
+            copy_data=False,
+        )
     except TypeError:
         return cKDTree(points)
 
@@ -945,6 +986,15 @@ def _select_ud_indices(
     if r_total > X.shape[0]:
         raise ValueError("r_total cannot exceed population size.")
 
+    # ── Per-worker cache: reuse indices for identical (X, W, r, seed) ──
+    global _UD_INDICES_CACHE
+    cache_key = (
+        id(X), id(W), int(r_total), int(cache_seed),
+        int(B_gamma) if B_gamma is not None else -1,
+    )
+    if _UD_INDICES_CACHE is not None and _UD_INDICES_CACHE[0] == cache_key:
+        return _UD_INDICES_CACHE[1].copy()
+
     treated_idx = np.where(W == 1)[0]
     control_idx = np.where(W == 0)[0]
 
@@ -970,7 +1020,9 @@ def _select_ud_indices(
 
     t0 = time.perf_counter()
     rho_0 = getattr(config, "UD_VARIANCE_THRESHOLD", 0.85)
-    X_tilde = _standardise_covariates(X.astype(np.float64))
+    # copy=False avoids redundant 40 MB allocation at n=5e5 × p=10 when
+    # X is already float64 (the common case from generate_obs_*).
+    X_tilde = _standardise_covariates(np.asarray(X, dtype=np.float64))
     Z_all, _V_q, q = _pca_rotate(X_tilde, rho_0)
     if profile is not None:
         profile["standardize_pca"] += time.perf_counter() - t0
@@ -1001,19 +1053,24 @@ def _select_ud_indices(
         profile["kd_build"] += time.perf_counter() - t4
 
     t5 = time.perf_counter()
-    selected_treated = np.empty(r_p, dtype=np.intp)
-    selected_control = np.empty(r_p, dtype=np.intp)
-    for j in range(r_p):
-        v_j = V_skeleton[j]
-        t_local = _kdtree_query_nearest(tree_treated, v_j)
-        c_local = _kdtree_query_nearest(tree_control, v_j)
-        selected_treated[j] = treated_idx[t_local]
-        selected_control[j] = control_idx[c_local]
+    # Batched NN query: cKDTree.query handles (r_p, q) in one C-level call,
+    # eliminating Python-loop overhead at large r_p (~10× faster at r_p=12500).
+    try:
+        _, t_locals = tree_treated.query(V_skeleton, k=1, workers=1)
+        _, c_locals = tree_control.query(V_skeleton, k=1, workers=1)
+    except TypeError:
+        _, t_locals = tree_treated.query(V_skeleton, k=1)
+        _, c_locals = tree_control.query(V_skeleton, k=1)
+    selected_treated = treated_idx[np.asarray(t_locals, dtype=np.intp).ravel()]
+    selected_control = control_idx[np.asarray(c_locals, dtype=np.intp).ravel()]
     if profile is not None:
         profile["matching"] += time.perf_counter() - t5
 
     combined = np.concatenate([selected_treated, selected_control])
     rng.shuffle(combined)
+    # Store pre-shuffle would preserve deterministic index set, but callers
+    # only need the unordered selection, so cache the shuffled array.
+    _UD_INDICES_CACHE = (cache_key, combined.copy())
     return combined
 
 

@@ -21,11 +21,15 @@ __pycache__/
 # Simulation and Analysis Results
 simulation_results/
 analysis_results/
+real_data_results/
+real_data_results_fast_demo/
+
 
 # UD GLP skeleton disk cache (regenerable)
 ud_bench_cache/
 ud_skeleton_cache/
 test/
+Nat2021us/
 
 # OS files
 .DS_Store

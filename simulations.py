@@ -84,6 +84,29 @@ def _sanitize_thread_env_main_process() -> None:
 
 _sanitize_thread_env_main_process()
 
+
+def _prefer_tmpfs_for_joblib() -> None:
+    """On Linux, point joblib's scratch to tmpfs (``/dev/shm``) if available.
+
+    joblib pickles per-task args and large return payloads through this
+    folder; tmpfs is RAM-backed, 10-50× faster than spinning/SSD disk, and
+    avoids wear.  Honours a pre-set ``JOBLIB_TEMP_FOLDER`` without override.
+    60 GB server RAM easily fits a handful of transient GB.
+    """
+    if os.name != "posix":
+        return
+    if os.environ.get("JOBLIB_TEMP_FOLDER"):
+        return
+    shm = "/dev/shm"
+    try:
+        if os.path.isdir(shm) and os.access(shm, os.W_OK):
+            os.environ["JOBLIB_TEMP_FOLDER"] = shm
+    except OSError:
+        pass
+
+
+_prefer_tmpfs_for_joblib()
+
 import joblib.parallel as joblib_parallel
 import matplotlib.pyplot as plt
 import numpy as np
@@ -215,12 +238,18 @@ def _get_scenarios_and_methods_cached() -> Tuple[Dict, Dict]:
 # Helper utilities
 # =============================================================================
 
-# tqdm: show fraction, wall elapsed, ETA, rate, and a live postfix (scenario/method/r/mem).
+# tqdm kwargs.  ``smoothing=0`` is critical for parallel runs: it makes tqdm
+# compute rate as ``n_done / elapsed_wall`` (global average) instead of an
+# EMA over recent completions.  Under joblib, completion callbacks fire in
+# bursts (one per worker finishing), which inflates the EMA rate to "seconds
+# per replication inside a worker" and bloats the ETA by ~n_workers×.  With
+# smoothing=0, ETA = remaining × elapsed_wall / n_done is a true wall-clock
+# estimate of the remaining runtime on the current worker pool.
 _SIM_TQDM_KWARGS = {
     "unit": "repl",
     "dynamic_ncols": True,
-    "mininterval": 0.25,
-    "smoothing": 0.15,
+    "mininterval": 0.5,
+    "smoothing": 0.0,
     "bar_format": (
         "{l_bar}{bar}| {n_fmt}/{total_fmt} "
         "[elapsed {elapsed} | ETA {remaining} | {rate_fmt}{postfix}]"
@@ -426,22 +455,17 @@ def _generate_variant_blueprints(exp_name, exp_config):
                 }
             )
             variants.append(_apply_fast_demo_overrides(variant))
-    elif exp_name == "experiment_nuisance_sensitivity":
-        r_totals = params.get("r_totals", [])
-        learners = params.get("nuisance_learners", [])
-        if FAST_DEMO_MODE:
-            r_totals = _trim_for_fast_demo(r_totals)
-        for learner in learners:
-            for r_total in r_totals:
-                variant = base.copy()
-                variant.update(
-                    {
-                        "label": f"{learner}_r-{int(r_total)}",
-                        "learner": learner,
-                        "r_total": int(r_total),
-                    }
-                )
-                variants.append(_apply_fast_demo_overrides(variant))
+    elif exp_name == "experiment_overlap_gradient":
+        for c in params.get("overlap_strengths", [1.0]):
+            variant = base.copy()
+            variant.update(
+                {
+                    "label": f"c-{float(c):.1f}".replace(".", "p"),
+                    "r_total": params["r_total"],
+                    "overlap_strength": float(c),
+                }
+            )
+            variants.append(_apply_fast_demo_overrides(variant))
     else:
         variant = base.copy()
         variant["label"] = "default"
@@ -500,6 +524,37 @@ def _replication_worker_cap_nested_threads() -> None:
         os.environ[key] = n
 
 
+# ─── Per-worker DGP cache ──────────────────────────────────────────────────
+# Holds one generated dataset. Adjacent tasks with the same
+# (scenario, sim_id, population_size, overlap_strength) reuse it, saving
+# the O(n) data-generation cost (≈1-2 s per call at n=5e5 × p=10).
+_WORKER_DATA_CACHE: Optional[Tuple[Tuple, Dict]] = None
+
+
+def _get_or_generate_data(scenario_cfg, scenario_name, sim_id, variant):
+    """Return (data, data_params). Cached across consecutive same-group tasks."""
+    global _WORKER_DATA_CACHE
+    data_params = dict(scenario_cfg["params"])
+    if variant.get("population_size"):
+        data_params["n"] = variant["population_size"]
+    if variant.get("overlap_strength") is not None:
+        data_params["overlap_strength"] = float(variant["overlap_strength"])
+    key = (
+        scenario_name,
+        int(sim_id),
+        int(data_params.get("n", 0)),
+        data_params.get("overlap_strength"),
+    )
+    if _WORKER_DATA_CACHE is not None and _WORKER_DATA_CACHE[0] == key:
+        return _WORKER_DATA_CACHE[1], data_params
+    # Evict prior cache (only hold one dataset at a time to bound RAM).
+    _WORKER_DATA_CACHE = None
+    np.random.seed(config.BASE_SEED + int(sim_id))
+    data = scenario_cfg["data_gen_func"](**data_params)
+    _WORKER_DATA_CACHE = (key, data)
+    return data, data_params
+
+
 def run_single_replication(task):
     """Execute one Monte Carlo replication with checkpoint support."""
     _replication_worker_cap_nested_threads()
@@ -520,15 +575,13 @@ def run_single_replication(task):
             pass  # corrupted; recompute
 
     try:
-        np.random.seed(config.BASE_SEED + int(sim_id))
         scenarios, all_methods = _get_scenarios_and_methods_cached()
         scenario_cfg = scenarios[scenario_name]
         method_cfg = all_methods[method_name]
 
-        data_params = dict(scenario_cfg["params"])
-        if variant.get("population_size"):
-            data_params["n"] = variant["population_size"]
-        data = scenario_cfg["data_gen_func"](**data_params)
+        data, data_params = _get_or_generate_data(
+            scenario_cfg, scenario_name, sim_id, variant,
+        )
         func = method_cfg["func"]
 
         learner = variant.get("learner", getattr(config, "DEFAULT_NUISANCE_LEARNER", "lgbm"))
@@ -578,6 +631,8 @@ def run_single_replication(task):
             "store_sample": variant.get("store_sample", False),
             "covariates": scenario_cfg.get("covariates", "x1"),
         }
+        if variant.get("overlap_strength") is not None:
+            metadata["overlap_strength"] = float(variant["overlap_strength"])
         if variant.get("misspecification"):
             metadata["misspecification"] = variant["misspecification"]
 
@@ -604,10 +659,9 @@ def run_single_replication(task):
             result["treatment_full"] = np.asarray(data["W"], dtype=np.int8)
 
         result = _prepare_result_for_storage(result)
-        # Drop full-population dict in the worker as soon as outputs are detached (reduces peak RAM).
-        del data
-        if _task_population(task) >= 300_000:
-            gc.collect()
+        # NB: do NOT `del data` — it's owned by _WORKER_DATA_CACHE and reused
+        # by the next task in the same (scenario, sim_id) group.  Eviction
+        # happens in `_get_or_generate_data` when the group key changes.
 
         legacy_file = checkpoint_file.with_suffix("")
         if legacy_file.exists():
@@ -616,7 +670,9 @@ def run_single_replication(task):
             except Exception:
                 pass
         checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(checkpoint_file, "wb") as f:
+        # compresslevel=1 is 3-5× faster than default 9, file ~20% bigger.
+        # At 30k checkpoint writes, saves ~10-25 min wall on a full run.
+        with gzip.open(checkpoint_file, "wb", compresslevel=1) as f:
             pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         return result
@@ -704,16 +760,28 @@ def _parallel_task_chunk_len(
 
 
 def _task_sort_key(task):
+    """Sort so tasks sharing the same DGP data end up adjacent.
+
+    Primary cluster key: (scenario, sim_id, population_size, overlap_strength).
+    All methods (UD, UNIF, FULL) and subsample sizes for one (scen, sim_id,
+    pop, overlap) group land in a contiguous block.  Combined with the
+    worker-local ``_WORKER_DATA_CACHE``, this means joblib dispatches the
+    whole block to one worker and only the first task pays the O(n)
+    data-generation cost; the remaining tasks reuse the cached array.
+    """
     _, scenario_name, method_name, sim_id, variant, _ = task
     r_total = variant.get("r_total")
     r_total = -1 if r_total is None else int(r_total)
+    overlap = variant.get("overlap_strength")
+    overlap_key = -1.0 if overlap is None else float(overlap)
     method_rank = {"UD": 0, "FULL": 1, "UNIF": 2}.get(method_name, 9)
     return (
-        -_task_population(task),
-        method_rank,
+        -_task_population(task),          # heavy jobs first (pop-desc)
+        scenario_name,                    # group by scenario
+        int(sim_id),                      # group by replication id
+        overlap_key,                      # group by overlap strength
+        method_rank,                      # UD before UNIF (minor)
         -r_total,
-        scenario_name,
-        int(sim_id),
     )
 
 
@@ -776,7 +844,8 @@ def precompute_ud_skeletons(experiment_names: List[str]) -> None:
         desc="UD skeleton warmup",
         unit="spec",
         dynamic_ncols=True,
-        mininterval=0.25,
+        mininterval=0.5,
+        smoothing=0.0,
         bar_format=(
             "{l_bar}{bar}| {n_fmt}/{total_fmt} "
             "[elapsed {elapsed} | ETA {remaining}{postfix}]"
@@ -1379,14 +1448,24 @@ def run_experiment(exp_name, n_jobs=-1):
 
     print(f"\nTotal task count: {len(all_tasks)}")
 
-    existing_results = []
-    pending_tasks = []
-    for task in all_tasks:
-        cached = _try_load_checkpoint_result(task)
-        if cached is not None:
-            existing_results.append(cached)
-        else:
-            pending_tasks.append(task)
+    # ── Parallel checkpoint scan ───────────────────────────────────────────
+    # Disk-I/O-bound gunzip+pickle.load, safe under threads (releases GIL).
+    # ~10-20× faster for resuming 30k-task experiments vs serial scan.
+    existing_results: List = []
+    pending_tasks: List = []
+    scan_workers = min(32, max(4, (os.cpu_count() or 8)))
+    from concurrent.futures import ThreadPoolExecutor
+    scan_t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=scan_workers) as pool:
+        for task, cached in zip(all_tasks, pool.map(
+            _try_load_checkpoint_result, all_tasks, chunksize=64,
+        )):
+            if cached is not None:
+                existing_results.append(cached)
+            else:
+                pending_tasks.append(task)
+    scan_dt = time.perf_counter() - scan_t0
+    print(f"  Checkpoint scan: {scan_dt:.2f}s ({scan_workers} threads)")
 
     if existing_results:
         print(f"-> Reusing {len(existing_results)} cached replications")
@@ -1438,7 +1517,17 @@ def run_experiment(exp_name, n_jobs=-1):
                 population_cap = min(population_cap, 32)
             capped_jobs = max(1, min(raw_jobs, population_cap, len(pending_tasks)))
             pre_dispatch = _parallel_pre_dispatch(max_population)
-            # Rough disk footprint of existing checkpoints for this experiment.
+            # Batch size tuned to maximise worker-local DGP cache hits.
+            # Sorted tasks keep same-(scenario, sim_id) blocks contiguous;
+            # a batch on one worker reuses the first-task's generated data
+            # for the whole block.  Balance against RAM pressure for huge n.
+            if max_population >= 500_000:
+                batch_size = 1
+            elif max_population >= 300_000:
+                batch_size = 2
+            else:
+                batch_size = 4
+            # Rough disk footprint of existing checkpoints.
             try:
                 ckpt_bytes = sum(
                     p.stat().st_size
@@ -1453,17 +1542,13 @@ def run_experiment(exp_name, n_jobs=-1):
                     f"workers           : {capped_jobs} "
                     f"(cap={population_cap}, raw={raw_jobs}, max_jobs={MAX_PARALLEL_JOBS})",
                     f"pre-dispatch      : {pre_dispatch!r} (streamed, bounded queue)",
+                    f"batch size        : {batch_size} (DGP cache reuse within batch)",
                     f"population (max)  : {max_population:,}",
                     f"pending tasks     : {len(pending_tasks):,}",
                     f"checkpoint dir    : {checkpoint_dir}  ({ckpt_bytes / (1024 ** 3):.2f} GB on disk)",
                     f"UD disk cache     : {os.environ.get('UD_SKELETON_DISK_CACHE', 'default ./ud_skeleton_cache')}",
                 ],
             )
-
-            # One executor, streaming consumption:
-            #   * generator_unordered  -> start collecting results as they finish
-            #   * batch_size=1         -> tqdm updates per-replication (no stall)
-            #   * pre_dispatch scaled  -> bounded in-flight tasks => bounded RAM
             with tqdm(
                 total=len(pending_tasks),
                 desc=f"Simulations ({exp_name})",
@@ -1473,7 +1558,7 @@ def run_experiment(exp_name, n_jobs=-1):
                     with Parallel(
                         n_jobs=capped_jobs,
                         verbose=0,
-                        batch_size=1,
+                        batch_size=batch_size,
                         pre_dispatch=pre_dispatch,
                         return_as="generator_unordered",
                     ) as parallel:
@@ -1516,7 +1601,7 @@ def run_experiment(exp_name, n_jobs=-1):
             legacy_results.unlink()
         except Exception:
             pass
-    with gzip.open(results_file, "wb") as f:
+    with gzip.open(results_file, "wb", compresslevel=1) as f:
         pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"-> Saved raw results to: {results_file}")
 

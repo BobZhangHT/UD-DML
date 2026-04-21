@@ -27,27 +27,24 @@ plt.switch_backend("Agg")
 # =============================================================================
 
 METRIC_COLUMNS = ["Bias", "RMSE", "CI_Coverage", "CI_Width", "Runtime"]
-SCENARIO_ORDER = ["RCT-1", "RCT-2", "RCT-3", "OBS-1", "OBS-2", "OBS-3"]
+SCENARIO_ORDER = ["OBS-1", "OBS-2", "OBS-3"]
 SCENARIO_COLORS = {
-    "RCT-1": "#d62728",
-    "RCT-2": "#9467bd",
-    "RCT-3": "#8c564b",
-    "OBS-1": "#1f77b4",
-    "OBS-2": "#ff7f0e",
-    "OBS-3": "#2ca02c",
+    "OBS-1": "#0072B2",    # Okabe-Ito blue
+    "OBS-2": "#E69F00",    # Okabe-Ito orange
+    "OBS-3": "#CC79A7",    # Okabe-Ito reddish purple
 }
 SCENARIO_MARKERS = {
-    "RCT-1": "D",
-    "RCT-2": "P",
-    "RCT-3": "X",
     "OBS-1": "o",
     "OBS-2": "s",
     "OBS-3": "^",
 }
+# Colorblind-safe palette (Okabe-Ito, recommended by Nature).
+# UD = vermillion (warm), UNIF = sky blue (cool), FULL = bluish green.
+# These MUST stay consistent across ALL figures in the paper.
 METHOD_COLORS = {
-    "UD": "#1f77b4",
-    "UNIF": "#ff7f0e",
-    "FULL": "#2ca02c",
+    "UD": "#D55E00",       # vermillion — proposed method, always warm/prominent
+    "UNIF": "#56B4E9",     # sky blue — baseline, always cool
+    "FULL": "#009E73",     # bluish green — gold standard
 }
 METHOD_DEFAULT_MARKERS = {
     "UD": "o",
@@ -341,6 +338,7 @@ def prepare_dataframe(results: List[Dict]) -> pd.DataFrame:
             "subsample_unique": res.get("subsample_unique"),
             "runtime": res.get("runtime"),
             "misspecification": res.get("misspecification"),
+            "overlap_strength": res.get("overlap_strength"),
             "est_ate": est_ate,
             "ci_lower": ci_lower,
             "ci_upper": ci_upper,
@@ -530,7 +528,7 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
         if len(obs_order) == 1:
             axes = np.expand_dims(axes, axis=1)
         
-        colors = {"Treatment": "#d62728", "Control": "#1f77b4"}
+        colors = {"Treatment": "#D55E00", "Control": "#56B4E9"}  # Okabe-Ito: consistent with METHOD_COLORS UD/UNIF
         bins = np.linspace(0.0, 1.0, 60)
         
         # Row 1: Full data
@@ -705,6 +703,68 @@ def _subsample_size_reports(df: pd.DataFrame, analysis_dir: Path):
     )
     fig.tight_layout()
     _save_figure_multi_format(fig, figures_dir / "subsample_size_metrics")
+
+    # ── Q-Q normality plot (Figure 3) ──
+    # Uses all replications at the LARGEST r_total for OBS-3.
+    # Needs ≥ 10 reps to produce a meaningful distribution.
+    r_max = df["r_total"].dropna().max()
+    qq_df = df[
+        (df["scenario"].astype(str) == "OBS-3") &
+        (df["r_total"] == r_max)
+    ]
+    if qq_df.empty:
+        qq_df = df[df["r_total"] == r_max]
+
+    methods_qq = _methods_present(qq_df)
+    if len(methods_qq) >= 2:
+        from scipy.stats import norm as _norm_dist
+        # Compact 1×2 layout: shared y-axis, tight wspace
+        fig_qq, axes_qq = plt.subplots(
+            1, len(methods_qq),
+            figsize=(4.2 * len(methods_qq), 4.2),
+            sharey=True,
+            gridspec_kw={"wspace": 0.08},
+        )
+        if len(methods_qq) == 1:
+            axes_qq = [axes_qq]
+        for idx, method in enumerate(methods_qq):
+            ax = axes_qq[idx]
+            mdf = qq_df[qq_df["method"] == method]
+            estimates = mdf["est_ate"].dropna().values
+            true_vals = mdf["true_ate"].dropna().values
+            if len(estimates) < 10 or len(true_vals) == 0:
+                ax.text(0.5, 0.5, f"< 10 reps\n(need ≥ 10)", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=14)
+                ax.set_title(f"{method}-DML")
+                continue
+            theta0 = float(true_vals[0])
+            se = float(np.std(estimates, ddof=1))
+            if se < 1e-12:
+                continue
+            z_scores = np.sort((estimates - theta0) / se)
+            n_pts = len(z_scores)
+            theoretical = np.array([
+                float(_norm_dist.ppf((i + 0.5) / n_pts)) for i in range(n_pts)
+            ])
+            color = METHOD_COLORS.get(method, "#444")
+            ax.scatter(theoretical, z_scores, s=16, alpha=0.6, color=color, edgecolors="none")
+            lim = max(abs(theoretical.min()), abs(theoretical.max()), 3.2)
+            ax.plot([-lim, lim], [-lim, lim], "k--", linewidth=1, alpha=0.5)
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_xlabel("Theoretical quantiles")
+            if idx == 0:
+                ax.set_ylabel("Empirical quantiles")
+            ax.set_title(f"{method}-DML")
+            ax.set_aspect("equal")
+            ax.grid(True, ls="--")
+        scen_label = "OBS-3" if not qq_df.empty else "all"
+        fig_qq.suptitle(
+            f"Q-Q normality plot ($r={int(r_max)}$, {scen_label})",
+            fontweight="bold", y=1.01,
+        )
+        fig_qq.tight_layout(rect=[0, 0, 1, 0.93])
+        _save_figure_multi_format(fig_qq, figures_dir / "qq_normality")
 
 
 def _population_size_reports(
@@ -1413,12 +1473,256 @@ def _nuisance_sensitivity_reports(
         _save_figure_multi_format(fig, figures_dir / f"nuisance_sensitivity_{scenario}")
 
 # =============================================================================
+# New Experiment Reports (Consolidated Plan)
+# =============================================================================
+
+
+def _overlap_gradient_reports(
+    df: pd.DataFrame,
+    analysis_dir: Path,
+    allowed_methods: Iterable[str] | None = None,
+):
+    """Experiment 2: Overlap gradient (Figure 2 + Table 1 bottom).
+
+    Produces:
+    - 2-panel figure: left = RMSE vs c, right = RMSE ratio (UNIF/UD) vs c.
+    - CSV + LaTeX table with RMSE, CI Coverage, CI Width, ESS per c.
+    """
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+    if "overlap_strength" not in df.columns:
+        return
+
+    summary = _aggregate_metrics(
+        df, ["overlap_strength", "method"]
+    )
+    if summary.empty:
+        return
+    summary.sort_values(["overlap_strength", "method"], inplace=True)
+    methods_present = _methods_present(summary, allowed_methods)
+
+    # CSV
+    out = summary.copy()
+    out.to_csv(tables_dir / "overlap_gradient_summary.csv", index=False)
+
+    # ── Figure 2: 2-panel ──
+    c_vals = sorted(summary["overlap_strength"].dropna().unique())
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    for method in methods_present:
+        mdf = summary[summary["method"] == method].sort_values("overlap_strength")
+        ax1.plot(
+            mdf["overlap_strength"], mdf["RMSE"],
+            marker=_get_method_marker(method),
+            color=METHOD_COLORS.get(method, "#444"),
+            label=method, linewidth=2.4, markersize=8,
+        )
+    ax1.set_xlabel("Overlap strength $c$")
+    ax1.set_ylabel("RMSE")
+    ax1.set_title("RMSE vs overlap severity")
+    ax1.legend()
+    ax1.grid(True, ls="--")
+
+    # RMSE ratio UNIF/UD
+    if "UD" in methods_present and "UNIF" in methods_present:
+        ud = summary[summary["method"] == "UD"].set_index("overlap_strength")["RMSE"]
+        unif = summary[summary["method"] == "UNIF"].set_index("overlap_strength")["RMSE"]
+        ratio = (unif / ud).dropna()
+        ax2.plot(
+            ratio.index, ratio.values,
+            "s-", color="#333333", linewidth=2.4, markersize=8,
+        )
+        ax2.axhline(1.0, ls=":", color="gray", alpha=0.7)
+        ax2.set_xlabel("Overlap strength $c$")
+        ax2.set_ylabel("RMSE ratio (UNIF / UD)")
+        ax2.set_title("UD-DML advantage ratio")
+        ax2.grid(True, ls="--")
+
+    fig.tight_layout()
+    _save_figure_multi_format(fig, figures_dir / "overlap_gradient")
+
+    # ── LaTeX Table 1 (overlap gradient) ──
+    tex_lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Overlap gradient experiment. RMSE, CI Coverage, and CI Width "
+        r"for UD-DML and UNIF-DML as the propensity coefficient strength $c$ varies "
+        r"from near-perfect overlap ($c=0.1$) to extreme confounding ($c=1.5$). "
+        r"OBS-3 structure, $n=5\times10^5$, $r=5000$, $B=500$ replications.}",
+        r"\label{tab:overlap_gradient}",
+        r"\setlength{\tabcolsep}{5pt}",
+        r"\begin{tabular}{lrrrrrr}",
+        r"\toprule",
+        r" & \multicolumn{2}{c}{RMSE} & \multicolumn{2}{c}{CI Coverage} & \multicolumn{2}{c}{CI Width} \\",
+        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}",
+        r"$c$ & UD & UNIF & UD & UNIF & UD & UNIF \\",
+        r"\midrule",
+    ]
+    for c_val in c_vals:
+        row_parts = [f"{c_val:.1f}"]
+        for metric in ["RMSE", "CI_Coverage", "CI_Width"]:
+            for method in ["UD", "UNIF"]:
+                val = summary[
+                    (summary["overlap_strength"] == c_val) &
+                    (summary["method"] == method)
+                ][metric]
+                if not val.empty:
+                    fmt = "{:.3f}" if metric != "CI_Coverage" else "{:.2f}"
+                    row_parts.append(fmt.format(float(val.iloc[0])))
+                else:
+                    row_parts.append("")
+        tex_lines.append(" & ".join(row_parts) + r" \\")
+    tex_lines.extend([
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ])
+    (tables_dir / "overlap_gradient_table.tex").write_text(
+        "\n".join(tex_lines), encoding="utf-8"
+    )
+
+
+def _normality_and_balance_reports(
+    df: pd.DataFrame,
+    raw_results: List[Dict],
+    analysis_dir: Path,
+):
+    """Experiment 5: Q-Q normality plot (Figure 3) + SMD love plot (Figure 4).
+
+    Uses stored ATE estimates from the subsample_size experiment at r=5000,
+    scenario OBS-3. If data not available, skips gracefully.
+    """
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+
+    # ── Figure 3: Q-Q normality ──
+    # Filter to OBS-3, r=5000 (or largest available r)
+    obs3 = df[(df["scenario"].astype(str) == "OBS-3")]
+    if obs3.empty:
+        obs3 = df  # fall back to whatever is available
+
+    for method_filter in [["UD", "UNIF"]]:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        for idx, method in enumerate(method_filter):
+            ax = axes[idx]
+            mdf = obs3[obs3["method"] == method]
+            if mdf.empty:
+                ax.set_visible(False)
+                continue
+            estimates = mdf["est_ate"].dropna().values
+            true_ate = mdf["true_ate"].dropna().values
+            if len(estimates) < 10 or len(true_ate) == 0:
+                ax.set_visible(False)
+                continue
+            theta0 = float(true_ate[0])
+            se = float(np.std(estimates, ddof=1))
+            if se < 1e-12:
+                ax.set_visible(False)
+                continue
+            z_scores = (estimates - theta0) / se
+            z_scores_sorted = np.sort(z_scores)
+            n_pts = len(z_scores_sorted)
+            theoretical = np.array([
+                float(__import__("scipy").stats.norm.ppf((i + 0.5) / n_pts))
+                for i in range(n_pts)
+            ])
+            color = METHOD_COLORS.get(method, "#444")
+            ax.scatter(
+                theoretical, z_scores_sorted,
+                s=12, alpha=0.6, color=color, edgecolors="none",
+            )
+            lim = max(abs(theoretical.min()), abs(theoretical.max()), 3.5)
+            ax.plot([-lim, lim], [-lim, lim], "k--", linewidth=1, alpha=0.5)
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_xlabel("Theoretical quantiles")
+            ax.set_ylabel("Empirical quantiles")
+            ax.set_title(f"{method}-DML")
+            ax.set_aspect("equal")
+            ax.grid(True, ls="--")
+        fig.suptitle(
+            "Q-Q normality: standardised ATE estimates vs $N(0,1)$",
+            fontweight="bold", y=0.99,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+        _save_figure_multi_format(fig, figures_dir / "qq_normality")
+
+    # ── Figure 4: SMD love plot — 3 subplots (OBS-1, OBS-2, OBS-3) ──
+    # For each OBS scenario, regenerate full X and compute SMD using
+    # stored subsample_indices from the visualization run.
+    scenarios_cfg, _, _ = config.get_experiments()
+    obs_scenarios = [s for s in ["OBS-1", "OBS-2", "OBS-3"] if s in scenarios_cfg]
+
+    # Collect subsample indices per (scenario, method)
+    idx_map: Dict[str, Dict[str, np.ndarray]] = {}
+    for res in raw_results:
+        scen = res.get("scenario", "")
+        meth = res.get("method", "")
+        si = res.get("subsample_indices")
+        if scen in obs_scenarios and meth in ("UD", "UNIF") and si is not None:
+            idx_map.setdefault(scen, {})[meth] = np.asarray(si)
+
+    # Only plot scenarios where both UD and UNIF indices exist
+    plot_scenarios = [s for s in obs_scenarios
+                      if s in idx_map and "UD" in idx_map[s] and "UNIF" in idx_map[s]]
+    if not plot_scenarios:
+        return
+
+    n_panels = len(plot_scenarios)
+    fig, axes = plt.subplots(
+        1, n_panels,
+        figsize=(4.5 * n_panels, 4.5),
+        sharey=True,
+        gridspec_kw={"wspace": 0.06},
+    )
+    if n_panels == 1:
+        axes = [axes]
+
+    for col, scen in enumerate(plot_scenarios):
+        ax = axes[col]
+        scen_cfg = scenarios_cfg[scen]
+        np.random.seed(config.BASE_SEED)
+        regen = scen_cfg["data_gen_func"](**dict(scen_cfg["params"]))
+        full_X = regen["X"]
+        p_dim = full_X.shape[1]
+
+        full_mean = full_X.mean(axis=0)
+        full_std = full_X.std(axis=0, ddof=1)
+        full_std[full_std < 1e-12] = 1.0
+
+        def _smd(indices, _X=full_X, _mu=full_mean, _sd=full_std):
+            idx_safe = indices[indices < _X.shape[0]]
+            return np.abs(_X[idx_safe].mean(axis=0) - _mu) / _sd
+
+        smd_ud = _smd(idx_map[scen]["UD"])
+        smd_unif = _smd(idx_map[scen]["UNIF"])
+
+        y_pos = np.arange(p_dim)
+        ax.scatter(smd_unif, y_pos, marker="s", s=60, color=METHOD_COLORS["UNIF"],
+                   label="UNIF-DML" if col == 0 else None, zorder=3)
+        ax.scatter(smd_ud, y_pos, marker="o", s=60, color=METHOD_COLORS["UD"],
+                   label="UD-DML" if col == 0 else None, zorder=3)
+        ax.axvline(0.1, ls=":", color="gray", alpha=0.7,
+                   label="SMD = 0.1" if col == 0 else None)
+        ax.set_title(scen)
+        ax.set_xlabel("SMD")
+        if col == 0:
+            cov_labels = [f"$X_{{{d+1}}}$" for d in range(p_dim)]
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(cov_labels)
+        ax.grid(True, axis="x", ls="--")
+        ax.invert_yaxis()
+
+    axes[0].legend(loc="lower right", fontsize=11)
+    fig.suptitle("Covariate Balance", fontweight="bold", y=1.01)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    _save_figure_multi_format(fig, figures_dir / "smd_love_plot")
+
+
+# =============================================================================
 # Public entry point
 # =============================================================================
 
 
 def generate_reports(exp_name: str, results: List[Dict], output_dir: Path) -> Dict[str, Path]:
-    # Remove "experiment_" prefix from folder name
     folder_name = exp_name.replace("experiment_", "", 1) if exp_name.startswith("experiment_") else exp_name
     analysis_dir = Path("./analysis_results") / folder_name
     tables_dir, figures_dir = _ensure_directories(analysis_dir)
@@ -1427,18 +1731,19 @@ def generate_reports(exp_name: str, results: List[Dict], output_dir: Path) -> Di
     _, _, experiments = config.get_experiments()
     allowed_methods = experiments.get(exp_name, {}).get("methods")
     allowed_scenarios = experiments.get(exp_name, {}).get("scenarios")
+
     if exp_name == "experiment_visualization":
         _visualization_reports(results, analysis_dir)
+        _normality_and_balance_reports(df, results, analysis_dir)
     elif exp_name == "experiment_subsample_size":
         _subsample_size_reports(df, analysis_dir)
+    elif exp_name == "experiment_overlap_gradient":
+        _overlap_gradient_reports(df, analysis_dir, allowed_methods)
     elif exp_name == "experiment_population_size":
         _population_size_reports(df, analysis_dir, allowed_methods, allowed_scenarios)
     elif exp_name == "experiment_double_robust":
         _double_robust_reports(df, analysis_dir, allowed_methods, allowed_scenarios)
-    elif exp_name == "experiment_nuisance_sensitivity":
-        _nuisance_sensitivity_reports(df, analysis_dir, allowed_methods, allowed_scenarios)
     else:
-        # Fallback: export raw dataframe if no dedicated report exists.
         if not df.empty:
             df.to_csv(tables_dir / "raw_results.csv", index=False)
 

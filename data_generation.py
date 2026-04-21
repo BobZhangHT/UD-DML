@@ -256,3 +256,40 @@ def generate_obs_3_data(n: int, p: int = _DEFAULT_P) -> dict:
     Y_obs = g + W * delta + eps
     return {"X": X, "W": W, "Y_obs": Y_obs,
             "pi_true": pi, "true_ate": _TRUE_ATE}
+
+
+def generate_obs_3_overlap_data(
+    n: int,
+    p: int = _DEFAULT_P,
+    overlap_strength: float = 1.0,
+) -> dict:
+    """OBS-3 with tuneable overlap severity for the overlap gradient experiment.
+
+    logit(e(X)) = c * (0.3*X1 + 0.3*X2 - 0.5*X6)
+
+    c = 0   -> propensity = 0.5 (perfect overlap)
+    c = 1   -> default OBS-3 (low overlap)
+    c > 1   -> extreme confounding
+    """
+    X = _covariates_x3(n, p)
+    c = float(overlap_strength)
+
+    logit_e = c * (0.3 * X[:, 0] + 0.3 * X[:, 1] - 0.5 * X[:, 5])
+    pi = expit(logit_e)
+    W = np.random.binomial(1, pi)
+
+    g = (
+        np.sin(np.pi * X[:, 0])
+        + 0.5 * X[:, 1] * X[:, 2]
+        + 0.1 * X[:, 5] ** 3
+        + 0.2 * np.cos(X[:, 6])
+    )
+    delta = 1.0 + 0.5 * np.tanh(X[:, 0]) + 0.2 * X[:, 5] * X[:, 6]
+    eps = np.random.normal(0, 1, size=n)
+
+    Y_obs = g + W * delta + eps
+    return {
+        "X": X, "W": W, "Y_obs": Y_obs,
+        "pi_true": pi, "true_ate": _TRUE_ATE,
+        "overlap_strength": c,
+    }
