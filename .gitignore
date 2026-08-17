@@ -1,34 +1,64 @@
-# R related files
-.Rproj.user
-.Rhistory
-.RData
-.Ruserdata
+# Public repository allowlist: source code and reproducibility metadata only.
+/*
+!/.gitattributes
+!/.gitignore
+!/LICENSE
+!/README.md
+!/requirements.txt
+!/pytest.ini
+!/run_all.py
+!/build_genud.py
+!/config.py
+!/data_generation.py
+!/evaluation.py
+!/genUD.c
+!/genUD_wrapper.py
+!/methods.py
+!/real_data_analysis.py
+!/simulations.py
+!/tests/
+!/tests/**
 
-# Python cache
+# Python environments, caches, and tooling state.
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-.claude
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.env.*
 
-# Jupyter Notebook
-.ipynb_checkpoints/
-*.ipynb_checkpoints
+# Platform-specific native builds. Recreate with build_genud.py.
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
 
-# Simulation and Analysis Results
-simulation_results/
+# Private/local inputs and paper sources.
+Nat2021us/
+manuscripts/
+archive/
+
+# Generated results, checkpoints, caches, temporary files, and logs.
 analysis_results/
+simulation_results/
 real_data_results/
-real_data_results_fast_demo/
-
-
-# UD GLP skeleton disk cache (regenerable)
+real_data_results_*/
+run_logs/
+output/
+tmp/
 ud_bench_cache/
 ud_skeleton_cache/
-test/
-Nat2021us/
+*.log
+*.pid
 
-# OS files
+# Editor and operating-system metadata.
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db

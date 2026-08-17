@@ -7,11 +7,15 @@ Implements Algorithm 1 from:
     Qu, Xu & Zhang (2026). "UD-DML: Uniform Design Subsampling for
     Double Machine Learning over Massive Data."
 
-The module provides three estimators for the Average Treatment Effect (ATE):
+The module provides five estimators for the Average Treatment Effect (ATE),
+including two reviewer-facing component baselines:
 
-    * ``run_full``  — Full-data cross-fitted DML (gold standard).
+    * ``run_full``  — Full-data cross-fitted DML (reference estimator).
     * ``run_unif``  — Naive uniform random subsampling + DML (benchmark).
     * ``run_ud``    — Uniform Design subsampling + DML (proposed method).
+
+    * ``run_stratified_unif``: treatment-balanced random subsampling.
+    * ``run_sep_ud``: separate-arm uniform-design subsampling.
 
 Algorithm overview (UD-DML)
 ===========================
@@ -27,9 +31,10 @@ Algorithm overview (UD-DML)
        discrepancy D²_M.
     4. Map the skeleton to the rotated space through the marginal
        empirical inverse CDFs:  v_j = F̂_Z⁻¹(u_j).
-    5. For each skeleton point v_j, find the nearest treated and nearest
-       control unit in Z-space **with replacement** via exact ``cKDTree``
-       nearest-neighbour queries.
+    5. For each skeleton point v_j, select one treated and one control unit
+       in Z-space by one-to-one nearest-neighbour assignment.  Candidate
+       neighbours are obtained from exact ``cKDTree`` queries and each
+       original observation can be selected at most once.
 
 **Phase 2 — Cross-fitted DML on the selected original observations**
 
@@ -39,8 +44,9 @@ Algorithm overview (UD-DML)
 **Phase 3 — Estimation and Wald inference**
 
     8. Point estimate: θ̂ = (1/r) Σ ψ̂*.
-    9. Variance: σ̂² / r  with σ̂² the empirical variance of pseudo-outcomes.
-   10. Confidence interval: θ̂ ± z_{1-α/2} √(σ̂²/r).
+    9. For outcome-blind balanced selections, estimate the conditional
+       variance from the cross-fitted inverse-propensity residual component.
+   10. Form the corresponding Wald confidence interval.
 """
 
 from __future__ import annotations
@@ -56,6 +62,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import min_weight_full_bipartite_matching
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import LassoCV, LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import KFold
@@ -82,6 +90,10 @@ _UD_SKELETON_CACHE: Dict[Tuple[int, int, int, int], np.ndarray] = {}
 # plus subsampling parameters.  Saves ~1-2 s per call on n=5e5 when multiple
 # tasks (e.g. 4 misspec variants in double_robust) share the same DGP sample.
 _UD_INDICES_CACHE: Optional[Tuple[Tuple, np.ndarray]] = None
+
+# Increment whenever the semantics of the selected-index cache change.  Version
+# 2 replaces the original with-replacement 1-NN lookup by one-to-one matching.
+_UD_MATCHING_VERSION: int = 2
 
 # ---------------------------------------------------------------------------
 # Optional compiled C backend for the GLP search.  Enabled by default when
@@ -242,6 +254,74 @@ def _wald_inference(scores: np.ndarray) -> Tuple[float, float, float]:
     est_ate = float(np.mean(scores))
     se = float(np.std(scores, ddof=1) / np.sqrt(r))
     return est_ate, est_ate - _CI_Z * se, est_ate + _CI_Z * se
+
+
+def _selected_residual_inference(
+    scores: np.ndarray,
+    Y: np.ndarray,
+    W: np.ndarray,
+    mu0: np.ndarray,
+    mu1: np.ndarray,
+    e: np.ndarray,
+) -> Tuple[float, float, float, float, float]:
+    """Conditional root-r inference for the UD-selected score estimator.
+
+    Conditional on the realised selected covariates and treatments, the
+    leading stochastic term is the inverse-propensity weighted outcome
+    residual.  Its uncentred second moment estimates the conditional
+    triangular-array variance in Theorem 3 of the revised manuscript.
+    """
+    r = int(scores.shape[0])
+    if r <= 1:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+    residual_scores = (
+        W * (Y - mu1) / e
+        - (1.0 - W) * (Y - mu0) / (1.0 - e)
+    )
+    est_ate = float(np.mean(scores))
+    residual_variance = float(np.mean(np.square(residual_scores)))
+    standard_error = float(np.sqrt(residual_variance / r))
+    return (
+        est_ate,
+        est_ate - _CI_Z * standard_error,
+        est_ate + _CI_Z * standard_error,
+        standard_error,
+        residual_variance,
+    )
+
+
+def _covariate_smd_diagnostics(X: np.ndarray, W: np.ndarray) -> Dict[str, Any]:
+    """Summarise treated-control standardized mean differences.
+
+    The denominator is the square root of the equally weighted within-arm
+    variances.  Constant coordinates with equal arm means are assigned zero;
+    constant coordinates with unequal means are assigned infinity.
+    """
+    X_arr = np.asarray(X, dtype=np.float64)
+    W_arr = np.asarray(W)
+    x1 = X_arr[W_arr == 1]
+    x0 = X_arr[W_arr == 0]
+    if x1.shape[0] < 2 or x0.shape[0] < 2:
+        return {
+            "smd_mean": np.nan,
+            "smd_max": np.nan,
+            "smd_count_above_0p1": np.nan,
+        }
+    numerator = np.abs(np.mean(x1, axis=0) - np.mean(x0, axis=0))
+    denominator = np.sqrt(
+        0.5 * (np.var(x1, axis=0, ddof=1) + np.var(x0, axis=0, ddof=1))
+    )
+    smd = np.divide(
+        numerator,
+        denominator,
+        out=np.where(numerator == 0.0, 0.0, np.inf),
+        where=denominator > np.finfo(np.float64).eps,
+    )
+    return {
+        "smd_mean": float(np.mean(smd)),
+        "smd_max": float(np.max(smd)),
+        "smd_count_above_0p1": int(np.sum(smd > 0.1)),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -495,7 +575,7 @@ def _fit_propensity_model(
 #           mixture discrepancy.
 #   Step 3: Empirical inverse CDF mapping → skeleton in Z-space.
 #   Step 4: Paired exact 1-NN matching (treated + control) in Z-space
-#           with replacement (Algorithm 1).
+#           without replacement via one-to-one assignment (Algorithm 1).
 #
 
 
@@ -803,6 +883,89 @@ def _mixture_discrepancy_squared(U: np.ndarray) -> float:
     return term1 + term2 + term3
 
 
+def _mixture_kernel_pairs(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Evaluate the product mixture kernel for aligned pairs of points."""
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.shape != right.shape or left.ndim != 2:
+        raise ValueError("left and right must be aligned two-dimensional arrays.")
+    diff = left - right
+    coordinate_kernel = (
+        15.0 / 8.0
+        - 0.25 * np.abs(left - 0.5)
+        - 0.25 * np.abs(right - 0.5)
+        - 0.75 * np.abs(diff)
+        + 0.5 * np.square(diff)
+    )
+    return np.prod(coordinate_kernel, axis=1)
+
+
+def _approximate_gefd(
+    Z: np.ndarray,
+    Z_sorted: np.ndarray,
+    U_skeleton: np.ndarray,
+    *,
+    seed: int,
+    n_pairs: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Monte Carlo approximation of the empirical mixture-kernel GEFD.
+
+    Full-sample points are converted to their marginal empirical-CDF
+    coordinates only for the randomly drawn pairs.  This avoids constructing
+    an additional ``n by q`` rank matrix or an infeasible quadratic kernel
+    matrix.  The reported Monte Carlo standard error pertains to the squared
+    discrepancy estimate before truncation at zero.
+    """
+    Z_arr = np.asarray(Z, dtype=np.float64)
+    sorted_arr = np.asarray(Z_sorted, dtype=np.float64)
+    U_arr = np.asarray(U_skeleton, dtype=np.float64)
+    if Z_arr.ndim != 2 or sorted_arr.shape != Z_arr.shape:
+        raise ValueError("Z and Z_sorted must have the same two-dimensional shape.")
+    if U_arr.ndim != 2 or U_arr.shape[1] != Z_arr.shape[1]:
+        raise ValueError("U_skeleton must have the same number of columns as Z.")
+    pairs = int(
+        n_pairs
+        if n_pairs is not None
+        else getattr(config, "GEFD_MONTE_CARLO_PAIRS", 20_000)
+    )
+    if pairs <= 1:
+        raise ValueError("GEFD_MONTE_CARLO_PAIRS must exceed one.")
+    rng = np.random.default_rng(int(seed))
+    n, q = Z_arr.shape
+    r_p = U_arr.shape[0]
+    full_left_idx = rng.integers(0, n, size=pairs)
+    full_right_idx = rng.integers(0, n, size=pairs)
+    skeleton_left_idx = rng.integers(0, r_p, size=pairs)
+    skeleton_right_idx = rng.integers(0, r_p, size=pairs)
+
+    def empirical_coordinates(indices: np.ndarray) -> np.ndarray:
+        coords = np.empty((pairs, q), dtype=np.float64)
+        sampled = Z_arr[indices]
+        for d in range(q):
+            coords[:, d] = (
+                np.searchsorted(sorted_arr[:, d], sampled[:, d], side="right") / n
+            )
+        return coords
+
+    full_left = empirical_coordinates(full_left_idx)
+    full_right = empirical_coordinates(full_right_idx)
+    contributions = (
+        _mixture_kernel_pairs(full_left, full_right)
+        - 2.0 * _mixture_kernel_pairs(full_left, U_arr[skeleton_left_idx])
+        + _mixture_kernel_pairs(
+            U_arr[skeleton_left_idx], U_arr[skeleton_right_idx]
+        )
+    )
+    squared_estimate = float(np.mean(contributions))
+    squared_mcse = float(np.std(contributions, ddof=1) / np.sqrt(pairs))
+    return {
+        "gefd_estimate": float(np.sqrt(max(squared_estimate, 0.0))),
+        "gefd_squared_estimate": squared_estimate,
+        "gefd_squared_mcse": squared_mcse,
+        "gefd_mc_pairs": pairs,
+    }
+
+
 def _select_optimal_uniform_design(
     r_p: int,
     q: int,
@@ -950,6 +1113,114 @@ def _kdtree_query_nearest(tree: cKDTree, point: np.ndarray) -> int:
     return int(np.atleast_1d(idx).ravel()[0])
 
 
+def _match_without_replacement(
+    tree: cKDTree,
+    targets: np.ndarray,
+    *,
+    initial_neighbors: int = 8,
+    max_neighbors: int = 256,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Match target points one-to-one to KD-tree observations.
+
+    The routine first obtains exact k-nearest-neighbour candidate edges from
+    ``cKDTree`` and then solves the minimum-weight full bipartite matching on
+    that sparse graph.  If collisions prevent a full assignment, ``k`` is
+    doubled until a solution is found or the explicit candidate cap is
+    reached.  Unlike the former batched 1-NN lookup, returned indices are
+    guaranteed to be unique.
+
+    Parameters
+    ----------
+    tree : cKDTree
+        Tree built on one treatment arm.
+    targets : ndarray of shape (m, q)
+        Skeleton points in the same rotated coordinate system.
+    initial_neighbors : int
+        Initial number of exact neighbours retained per target.
+    max_neighbors : int
+        Maximum candidate count per target.  Hitting the cap raises an
+        informative error instead of silently reusing observations.
+
+    Returns
+    -------
+    local_indices : ndarray of shape (m,)
+        Unique row indices into ``tree.data``.
+    distances : ndarray of shape (m,)
+        Euclidean matching distances.
+    neighbors_used : int
+        Candidate count at which the full assignment was found.
+    """
+    targets = np.asarray(targets, dtype=np.float64)
+    if targets.ndim != 2:
+        raise ValueError("targets must be a two-dimensional array.")
+
+    n_targets = int(targets.shape[0])
+    n_points = int(tree.n)
+    if n_targets == 0:
+        return np.empty(0, dtype=np.intp), np.empty(0), 0
+    if n_targets > n_points:
+        raise ValueError(
+            "Without-replacement matching requires at least as many arm "
+            "observations as skeleton targets."
+        )
+
+    cap = min(n_points, max(1, int(max_neighbors)))
+    k = min(cap, max(1, int(initial_neighbors)))
+    last_error: Optional[Exception] = None
+
+    while True:
+        try:
+            distances, candidate_idx = tree.query(targets, k=k, workers=1)
+        except TypeError:  # scipy < 1.6 compatibility
+            distances, candidate_idx = tree.query(targets, k=k)
+
+        distances = np.asarray(distances, dtype=np.float64)
+        candidate_idx = np.asarray(candidate_idx, dtype=np.intp)
+        if k == 1:
+            distances = distances[:, np.newaxis]
+            candidate_idx = candidate_idx[:, np.newaxis]
+
+        row_idx = np.repeat(np.arange(n_targets, dtype=np.intp), k)
+        col_idx = candidate_idx.reshape(-1)
+        edge_weights = distances.reshape(-1)
+        valid = (
+            np.isfinite(edge_weights)
+            & (col_idx >= 0)
+            & (col_idx < n_points)
+        )
+        # Sparse matching treats stored zeros as missing edges.  Adding machine
+        # epsilon preserves ordering while keeping exact-zero matches present.
+        graph = coo_matrix(
+            (
+                edge_weights[valid] + np.finfo(np.float64).eps,
+                (row_idx[valid], col_idx[valid]),
+            ),
+            shape=(n_targets, n_points),
+        ).tocsr()
+
+        try:
+            matched_rows, matched_cols = min_weight_full_bipartite_matching(graph)
+            if matched_rows.size != n_targets:
+                raise ValueError("candidate graph did not yield a full row matching")
+            order = np.argsort(matched_rows)
+            local_indices = np.asarray(matched_cols[order], dtype=np.intp)
+            if np.unique(local_indices).size != n_targets:
+                raise RuntimeError("bipartite matcher returned duplicate columns")
+            matched_points = np.asarray(tree.data)[local_indices]
+            matched_distances = np.linalg.norm(targets - matched_points, axis=1)
+            return local_indices, matched_distances, k
+        except ValueError as exc:
+            last_error = exc
+
+        if k >= cap:
+            raise RuntimeError(
+                "Unable to construct a unique UD match within the configured "
+                f"candidate cap ({cap} neighbours per target). Increase "
+                "config.UD_MATCH_MAX_NEIGHBORS or reduce r_total."
+            ) from last_error
+        k = min(cap, 2 * k)
+
+
 # ── Full UD Subsampling Pipeline ─────────────────────────────────────────
 
 
@@ -962,6 +1233,7 @@ def _select_ud_indices(
     B_gamma: Optional[int] = None,
     cache_seed: int,
     profile: Optional[Dict[str, float]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Execute Phase 1 of Algorithm 1: UD subsampling in PCA-rotated Z-space.
 
@@ -972,7 +1244,8 @@ def _select_ud_indices(
         4. GLP / power-generator candidates in [0,1]^q; search all admissible
            or a random subset of size B_γ; minimise mixture discrepancy D²_M.
         5. Map skeleton U → V in Z-space via empirical inverse CDF.
-        6. cKDTree on Z for each arm; **with-replacement** 1-NN matching per v_j.
+        6. cKDTree on Z for each arm; one-to-one nearest-neighbour assignment
+           without replacement.
 
     Parameters
     ----------
@@ -985,14 +1258,28 @@ def _select_ud_indices(
         raise ValueError("r_total must be positive for UD subsampling.")
     if r_total > X.shape[0]:
         raise ValueError("r_total cannot exceed population size.")
+    if r_total % 2 != 0:
+        raise ValueError("UD subsampling requires an even r_total for paired arms.")
+
+    # Keep the final fold order independent of whether the GLP skeleton came
+    # from cache (a cache hit consumes no generator-search random numbers).
+    shuffle_rng = np.random.default_rng(
+        int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+    )
 
     # ── Per-worker cache: reuse indices for identical (X, W, r, seed) ──
     global _UD_INDICES_CACHE
     cache_key = (
         id(X), id(W), int(r_total), int(cache_seed),
         int(B_gamma) if B_gamma is not None else -1,
+        _UD_MATCHING_VERSION,
     )
-    if _UD_INDICES_CACHE is not None and _UD_INDICES_CACHE[0] == cache_key:
+    if (
+        profile is None
+        and diagnostics is None
+        and _UD_INDICES_CACHE is not None
+        and _UD_INDICES_CACHE[0] == cache_key
+    ):
         return _UD_INDICES_CACHE[1].copy()
 
     treated_idx = np.where(W == 1)[0]
@@ -1001,9 +1288,11 @@ def _select_ud_indices(
     if treated_idx.size == 0 or control_idx.size == 0:
         raise ValueError("UD subsampling requires both treated and control units.")
 
-    r_p = min(treated_idx.size, control_idx.size, r_total // 2)
-    if r_p == 0:
-        raise ValueError("Insufficient treated/control units for UD subsampling.")
+    r_p = r_total // 2
+    if treated_idx.size < r_p or control_idx.size < r_p:
+        raise ValueError(
+            "UD subsampling requires at least r_total/2 observations in each arm."
+        )
 
     B = int(B_gamma if B_gamma is not None else getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30))
 
@@ -1053,25 +1342,116 @@ def _select_ud_indices(
         profile["kd_build"] += time.perf_counter() - t4
 
     t5 = time.perf_counter()
-    # Batched NN query: cKDTree.query handles (r_p, q) in one C-level call,
-    # eliminating Python-loop overhead at large r_p (~10× faster at r_p=12500).
-    try:
-        _, t_locals = tree_treated.query(V_skeleton, k=1, workers=1)
-        _, c_locals = tree_control.query(V_skeleton, k=1, workers=1)
-    except TypeError:
-        _, t_locals = tree_treated.query(V_skeleton, k=1)
-        _, c_locals = tree_control.query(V_skeleton, k=1)
-    selected_treated = treated_idx[np.asarray(t_locals, dtype=np.intp).ravel()]
-    selected_control = control_idx[np.asarray(c_locals, dtype=np.intp).ravel()]
+    # Exact KD-tree candidate queries followed by sparse one-to-one assignment.
+    max_neighbors = int(getattr(config, "UD_MATCH_MAX_NEIGHBORS", 256))
+    initial_neighbors = int(getattr(config, "UD_NEAREST_NEIGHBORS", 8))
+    t_locals, t_dist, t_k = _match_without_replacement(
+        tree_treated,
+        V_skeleton,
+        initial_neighbors=initial_neighbors,
+        max_neighbors=max_neighbors,
+    )
+    c_locals, c_dist, c_k = _match_without_replacement(
+        tree_control,
+        V_skeleton,
+        initial_neighbors=initial_neighbors,
+        max_neighbors=max_neighbors,
+    )
+    selected_treated = treated_idx[t_locals]
+    selected_control = control_idx[c_locals]
     if profile is not None:
         profile["matching"] += time.perf_counter() - t5
 
     combined = np.concatenate([selected_treated, selected_control])
-    rng.shuffle(combined)
+    if combined.size != r_total or np.unique(combined).size != r_total:
+        raise RuntimeError("UD matching failed to return r_total unique observations.")
+    if diagnostics is not None:
+        all_dist = np.concatenate([t_dist, c_dist])
+        diagnostics.update(
+            {
+                "retained_dimensions": int(q),
+                "variance_threshold": float(rho_0),
+                "treated_selected": int(selected_treated.size),
+                "control_selected": int(selected_control.size),
+                "matching_mean_distance": float(np.mean(all_dist)),
+                "matching_max_distance": float(np.max(all_dist)),
+                "treated_matching_mean_distance": float(np.mean(t_dist)),
+                "treated_matching_max_distance": float(np.max(t_dist)),
+                "control_matching_mean_distance": float(np.mean(c_dist)),
+                "control_matching_max_distance": float(np.max(c_dist)),
+                "treated_candidate_neighbors": int(t_k),
+                "control_candidate_neighbors": int(c_k),
+                "without_replacement": True,
+            }
+        )
+        diagnostics.update(
+            _approximate_gefd(
+                Z_all,
+                Z_sorted,
+                U_skeleton,
+                seed=cache_seed + 4001,
+            )
+        )
+    shuffle_rng.shuffle(combined)
     # Store pre-shuffle would preserve deterministic index set, but callers
     # only need the unordered selection, so cache the shuffled array.
     _UD_INDICES_CACHE = (cache_key, combined.copy())
     return combined
+
+
+def _select_separate_arm_ud_indices(
+    X: np.ndarray,
+    arm_indices: np.ndarray,
+    r_arm: int,
+    rng: np.random.Generator,
+    *,
+    B_gamma: Optional[int],
+    cache_seed: int,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Construct and match a UD independently within one treatment arm."""
+    if r_arm <= 0 or arm_indices.size < r_arm:
+        raise ValueError("Separate-arm UD requires at least r_arm observations.")
+
+    X_arm = np.asarray(X[arm_indices], dtype=np.float64)
+    rho_0 = float(getattr(config, "UD_VARIANCE_THRESHOLD", 0.85))
+    X_tilde = _standardise_covariates(X_arm)
+    Z_arm, _V_q, q = _pca_rotate(X_tilde, rho_0)
+    Z_sorted = _marginal_empirical_cdf_ranks(Z_arm)
+    B = int(
+        B_gamma
+        if B_gamma is not None
+        else getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30)
+    )
+    U_skeleton, _ = _select_optimal_uniform_design(
+        r_arm, q, B, rng, int(cache_seed),
+    )
+    V_skeleton = _map_skeleton_to_rotated_space(U_skeleton, Z_sorted)
+    tree = _build_kdtree(Z_arm)
+    local_idx, distances, candidate_k = _match_without_replacement(
+        tree,
+        V_skeleton,
+        initial_neighbors=int(getattr(config, "UD_NEAREST_NEIGHBORS", 8)),
+        max_neighbors=int(getattr(config, "UD_MATCH_MAX_NEIGHBORS", 256)),
+    )
+    selected = np.asarray(arm_indices[local_idx], dtype=np.intp)
+    if np.unique(selected).size != r_arm:
+        raise RuntimeError("Separate-arm UD returned duplicate observations.")
+    arm_diagnostics = {
+        "retained_dimensions": int(q),
+        "variance_threshold": rho_0,
+        "matching_mean_distance": float(np.mean(distances)),
+        "matching_max_distance": float(np.max(distances)),
+        "candidate_neighbors": int(candidate_k),
+    }
+    arm_diagnostics.update(
+        _approximate_gefd(
+            Z_arm,
+            Z_sorted,
+            U_skeleton,
+            seed=cache_seed + 4001,
+        )
+    )
+    return selected, arm_diagnostics
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1088,7 +1468,7 @@ def run_full(
     k_folds: int = 2,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Full-data cross-fitted DML estimator (gold standard).
+    """Full-data cross-fitted DML estimator (full-sample reference).
 
     Trains nuisance models on the entire dataset using K-fold cross-fitting
     and computes the AIPW-based ATE estimate.
@@ -1190,17 +1570,237 @@ def run_unif(
     )
     scores = _aipw_score(Y_sub, W_sub, mu0, mu1, e)
     est_ate, ci_lower, ci_upper = _wald_inference(scores)
+    score_variance = float(np.var(scores, ddof=1))
+    standard_error = float(np.sqrt(score_variance / scores.size))
+    design_diagnostics = _covariate_smd_diagnostics(X_sub, W_sub)
+    design_diagnostics.update(
+        {
+            "treated_selected": int(np.sum(W_sub == 1)),
+            "control_selected": int(np.sum(W_sub == 0)),
+            "without_replacement": True,
+        }
+    )
 
     return {
         "est_ate": est_ate,
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
+        "standard_error": standard_error,
+        "score_variance": score_variance,
+        "variance_method": "iid_pseudo_outcome",
         "runtime": time.time() - start,
         "subsample_size": r_total,
         "subsample_unique": r_total,
         "learner": learner,
         "subsample_projection": X_sub[:, :2].copy() if kwargs.get("store_sample") else None,
         "subsample_indices": idx.tolist(),
+        "design_diagnostics": design_diagnostics,
+    }
+
+
+def run_stratified_unif(
+    X: np.ndarray,
+    W: np.ndarray,
+    Y_obs: np.ndarray,
+    pi_true: Any,
+    is_rct: bool,
+    r: Dict[str, int],
+    k_folds: int = 2,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Treatment-balanced random subsampling followed by cross-fitted DML.
+
+    This diagnostic baseline isolates the contribution of enforcing exactly
+    ``r_total / 2`` treated and control observations from the contribution of
+    the uniform-design geometry.
+    """
+    start = time.perf_counter()
+    r_total = int(r["r_total"])
+    if r_total <= 0 or r_total % 2 != 0:
+        raise ValueError("STRAT-UNIF requires a positive even r_total.")
+    if r_total > X.shape[0]:
+        raise ValueError("r_total cannot exceed population size.")
+
+    treated_idx = np.flatnonzero(W == 1)
+    control_idx = np.flatnonzero(W == 0)
+    r_arm = r_total // 2
+    if treated_idx.size < r_arm or control_idx.size < r_arm:
+        raise ValueError("STRAT-UNIF requires at least r_total/2 units per arm.")
+
+    sim_seed = int(kwargs.get("sim_seed", config.BASE_SEED))
+    rng = np.random.default_rng(sim_seed + 29)
+    idx = np.concatenate(
+        [
+            rng.choice(treated_idx, size=r_arm, replace=False),
+            rng.choice(control_idx, size=r_arm, replace=False),
+        ]
+    )
+    rng.shuffle(idx)
+
+    X_sub, W_sub, Y_sub = X[idx], W[idx], Y_obs[idx]
+    pi_val = float(pi_true) if np.isscalar(pi_true) else float(np.mean(pi_true))
+    learner = kwargs.get("learner", getattr(config, "DEFAULT_NUISANCE_LEARNER", "lgbm"))
+    mu0, mu1, e = _fit_nuisance_models(
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        pi_val,
+        misspecification=kwargs.get("misspecification"),
+        learner=learner,
+    )
+    scores = _aipw_score(Y_sub, W_sub, mu0, mu1, e)
+    est_ate, ci_lower, ci_upper, standard_error, residual_variance = (
+        _selected_residual_inference(scores, Y_sub, W_sub, mu0, mu1, e)
+    )
+    design_diagnostics = _covariate_smd_diagnostics(X_sub, W_sub)
+    design_diagnostics.update(
+        {
+            "treated_selected": r_arm,
+            "control_selected": r_arm,
+            "without_replacement": True,
+        }
+    )
+    return {
+        "est_ate": est_ate,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "standard_error": standard_error,
+        "residual_variance": residual_variance,
+        "variance_method": "conditional_selected_residual",
+        "runtime": time.perf_counter() - start,
+        "subsample_size": int(idx.size),
+        "subsample_unique": int(np.unique(idx).size),
+        "learner": learner,
+        "subsample_projection": X_sub[:, :2].copy() if kwargs.get("store_sample") else None,
+        "subsample_indices": idx.tolist(),
+        "design_diagnostics": design_diagnostics,
+    }
+
+
+def run_sep_ud(
+    X: np.ndarray,
+    W: np.ndarray,
+    Y_obs: np.ndarray,
+    pi_true: Any,
+    is_rct: bool,
+    r: Dict[str, int],
+    k_folds: int = 2,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Separate-arm uniform-design subsampling followed by DML.
+
+    A distinct PCA/ECDF transform, GLP skeleton, and one-to-one match are
+    constructed inside each treatment arm.  This baseline isolates the value
+    of UD-DML's pooled transform and common paired skeleton.
+    """
+    start = time.perf_counter()
+    r_total = int(r["r_total"])
+    if r_total <= 0 or r_total % 2 != 0:
+        raise ValueError("SEP-UD requires a positive even r_total.")
+    if r_total > X.shape[0]:
+        raise ValueError("r_total cannot exceed population size.")
+
+    treated_idx = np.flatnonzero(W == 1)
+    control_idx = np.flatnonzero(W == 0)
+    r_arm = r_total // 2
+    if treated_idx.size < r_arm or control_idx.size < r_arm:
+        raise ValueError("SEP-UD requires at least r_total/2 units per arm.")
+
+    sim_seed = int(kwargs.get("sim_seed", config.BASE_SEED))
+    rng = np.random.default_rng(sim_seed + 37)
+    shuffle_rng = np.random.default_rng(
+        int(rng.integers(0, np.iinfo(np.uint32).max, dtype=np.uint32))
+    )
+    B_gamma = kwargs.get("B_gamma")
+    if B_gamma is not None:
+        B_gamma = int(B_gamma)
+    cache_seed = kwargs.get("cache_seed")
+    if cache_seed is None:
+        cache_seed = get_ud_cache_seed(
+            r_total,
+            scenario_name=kwargs.get("scenario_name"),
+            population_size=kwargs.get("population_size"),
+            B_gamma=B_gamma,
+        )
+    cache_seed = int(cache_seed)
+
+    selected_treated, treated_diag = _select_separate_arm_ud_indices(
+        X,
+        treated_idx,
+        r_arm,
+        rng,
+        B_gamma=B_gamma,
+        cache_seed=cache_seed + 1009,
+    )
+    selected_control, control_diag = _select_separate_arm_ud_indices(
+        X,
+        control_idx,
+        r_arm,
+        rng,
+        B_gamma=B_gamma,
+        cache_seed=cache_seed + 2003,
+    )
+    idx = np.concatenate([selected_treated, selected_control])
+    if np.unique(idx).size != r_total:
+        raise RuntimeError("SEP-UD failed to return r_total unique observations.")
+    shuffle_rng.shuffle(idx)
+
+    X_sub, W_sub, Y_sub = X[idx], W[idx], Y_obs[idx]
+    pi_val = float(pi_true) if np.isscalar(pi_true) else float(np.mean(pi_true))
+    learner = kwargs.get("learner", getattr(config, "DEFAULT_NUISANCE_LEARNER", "lgbm"))
+    mu0, mu1, e = _fit_nuisance_models(
+        X_sub,
+        W_sub,
+        Y_sub,
+        k_folds,
+        is_rct,
+        pi_val,
+        misspecification=kwargs.get("misspecification"),
+        learner=learner,
+    )
+    scores = _aipw_score(Y_sub, W_sub, mu0, mu1, e)
+    est_ate, ci_lower, ci_upper, standard_error, residual_variance = (
+        _selected_residual_inference(scores, Y_sub, W_sub, mu0, mu1, e)
+    )
+    mean_matching_distance = 0.5 * (
+        float(treated_diag["matching_mean_distance"])
+        + float(control_diag["matching_mean_distance"])
+    )
+    design_diagnostics = _covariate_smd_diagnostics(X_sub, W_sub)
+    design_diagnostics.update(
+        {
+            "treated_selected": r_arm,
+            "control_selected": r_arm,
+            "without_replacement": True,
+            "matching_mean_distance": mean_matching_distance,
+            "matching_max_distance": max(
+                float(treated_diag["matching_max_distance"]),
+                float(control_diag["matching_max_distance"]),
+            ),
+            "gefd_estimate": 0.5 * (
+                float(treated_diag["gefd_estimate"])
+                + float(control_diag["gefd_estimate"])
+            ),
+            "treated": treated_diag,
+            "control": control_diag,
+        }
+    )
+    return {
+        "est_ate": est_ate,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "standard_error": standard_error,
+        "residual_variance": residual_variance,
+        "variance_method": "conditional_selected_residual",
+        "runtime": time.perf_counter() - start,
+        "subsample_size": int(idx.size),
+        "subsample_unique": int(np.unique(idx).size),
+        "learner": learner,
+        "subsample_projection": X_sub[:, :2].copy() if kwargs.get("store_sample") else None,
+        "subsample_indices": idx.tolist(),
+        "design_diagnostics": design_diagnostics,
     }
 
 
@@ -1246,11 +1846,13 @@ def run_ud(
     """
     t_wall0 = time.perf_counter()
     phase1_prof: Optional[Dict[str, float]] = {} if return_profile else None
+    design_diagnostics: Dict[str, Any] = {}
 
     r_total = int(r["r_total"])
     if r_total <= 0:
         raise ValueError("r_total must be positive for UD-DML.")
-    r_total = min(r_total, X.shape[0])
+    if r_total > X.shape[0]:
+        raise ValueError("r_total cannot exceed population size for UD-DML.")
 
     sim_seed = int(kwargs.get("sim_seed", config.BASE_SEED))
     rng = np.random.default_rng(sim_seed + 31)
@@ -1275,6 +1877,7 @@ def run_ud(
         B_gamma=B_gamma,
         cache_seed=cache_seed,
         profile=phase1_prof,
+        diagnostics=design_diagnostics,
     )
     unique_count = int(np.unique(subsample_idx).size)
 
@@ -1297,7 +1900,10 @@ def run_ud(
     t_dml1 = time.perf_counter()
 
     t_inf0 = time.perf_counter()
-    est_ate, ci_lower, ci_upper = _wald_inference(scores)
+    est_ate, ci_lower, ci_upper, standard_error, residual_variance = (
+        _selected_residual_inference(scores, Y_sub, W_sub, mu0, mu1, e)
+    )
+    design_diagnostics.update(_covariate_smd_diagnostics(X_sub, W_sub))
     t_inf1 = time.perf_counter()
 
     total_time = time.perf_counter() - t_wall0
@@ -1306,12 +1912,16 @@ def run_ud(
         "est_ate": est_ate,
         "ci_lower": ci_lower,
         "ci_upper": ci_upper,
+        "standard_error": standard_error,
+        "residual_variance": residual_variance,
+        "variance_method": "conditional_selected_residual",
         "runtime": total_time,
         "subsample_size": len(subsample_idx),
         "subsample_unique": unique_count,
         "learner": learner,
         "subsample_projection": X_sub[:, :2].copy() if kwargs.get("store_sample") else None,
         "subsample_indices": subsample_idx.tolist(),
+        "design_diagnostics": design_diagnostics,
     }
     if return_profile:
         assert phase1_prof is not None

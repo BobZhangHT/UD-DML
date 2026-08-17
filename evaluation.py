@@ -42,16 +42,22 @@ SCENARIO_MARKERS = {
 # UD = vermillion (warm), UNIF = sky blue (cool), FULL = bluish green.
 # These MUST stay consistent across ALL figures in the paper.
 METHOD_COLORS = {
+    "STRAT-UNIF": "#E69F00",
+    "SEP-UD": "#CC79A7",
     "UD": "#D55E00",       # vermillion — proposed method, always warm/prominent
     "UNIF": "#56B4E9",     # sky blue — baseline, always cool
-    "FULL": "#009E73",     # bluish green — gold standard
+    "FULL": "#009E73",     # bluish green — full-sample reference
 }
 METHOD_DEFAULT_MARKERS = {
+    "STRAT-UNIF": "^",
+    "SEP-UD": "v",
     "UD": "o",
     "UNIF": "s",
     "FULL": "D",
 }
 METHOD_LEARNER_MARKERS = {
+    "STRAT-UNIF": {"lasso_cv": "^", "rf": "<", "lgbm": ">"},
+    "SEP-UD": {"lasso_cv": "v", "rf": "P", "lgbm": "h"},
     "UD": {"lasso_cv": "o", "rf": "^", "lgbm": "v"},
     "UNIF": {"lasso_cv": "s", "rf": "D", "lgbm": "P"},
     "FULL": {"lasso_cv": "X", "rf": "X", "lgbm": "X"},
@@ -326,6 +332,7 @@ def prepare_dataframe(results: List[Dict]) -> pd.DataFrame:
         ci_lower = res.get("ci_lower")
         ci_upper = res.get("ci_upper")
 
+        diagnostics = res.get("design_diagnostics") or {}
         record = {
             "exp_name": res.get("exp_name"),
             "scenario": res.get("scenario"),
@@ -342,10 +349,21 @@ def prepare_dataframe(results: List[Dict]) -> pd.DataFrame:
             "est_ate": est_ate,
             "ci_lower": ci_lower,
             "ci_upper": ci_upper,
+            "standard_error": res.get("standard_error"),
+            "variance_method": res.get("variance_method"),
             "true_ate": true_ate,
             "subsample_projection": res.get("subsample_projection"),
             "covariates": res.get("covariates"),
             "projection_dims": res.get("projection_dims"),
+            "smd_mean": diagnostics.get("smd_mean"),
+            "smd_max": diagnostics.get("smd_max"),
+            "smd_count_above_0p1": diagnostics.get("smd_count_above_0p1"),
+            "gefd_estimate": diagnostics.get("gefd_estimate"),
+            "gefd_squared_estimate": diagnostics.get("gefd_squared_estimate"),
+            "gefd_squared_mcse": diagnostics.get("gefd_squared_mcse"),
+            "gefd_mc_pairs": diagnostics.get("gefd_mc_pairs"),
+            "matching_mean_distance": diagnostics.get("matching_mean_distance"),
+            "matching_max_distance": diagnostics.get("matching_max_distance"),
         }
 
         record["Bias"] = est_ate - true_ate
@@ -363,6 +381,7 @@ def prepare_dataframe(results: List[Dict]) -> pd.DataFrame:
     if not df.empty:
         df["scenario"] = _set_scenario_category(df["scenario"])
     return df
+
 
 # =============================================================================
 # Experiment-specific reporting
@@ -407,7 +426,7 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
     cov_order = ["x1", "x2", "x3"]
     dgp_labels = {"x1": "DGP-X1", "x2": "DGP-X2", "x3": "DGP-X3"}
     axis_labels = {"x1": ("X1", "X2"), "x2": ("X1", "X6"), "x3": ("X1", "X6")}
-    method_order = [m for m in ("UD", "UNIF") if m in METHOD_COLORS]
+    method_order = [m for m in ("UNIF", "STRAT-UNIF", "SEP-UD", "UD") if m in METHOD_COLORS]
 
     fig, axes = plt.subplots(
         len(cov_order), len(method_order), figsize=(12, 12), sharex=False, sharey=False
@@ -463,29 +482,28 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
 
     obs_order = [sc for sc in ["OBS-1", "OBS-2", "OBS-3"] if sc in obs_propensity]
     if obs_order:
-        # Collect subsample propensity scores for UD and UNIF methods
+        # Collect subsample propensity scores for all four working-sample methods.
         # Use a single replication (sim_id) for consistency across methods
-        ud_propensity: Dict[str, np.ndarray] = {}
-        ud_treatment: Dict[str, np.ndarray] = {}
-        unif_propensity: Dict[str, np.ndarray] = {}
-        unif_treatment: Dict[str, np.ndarray] = {}
+        method_propensity: Dict[str, Dict[str, np.ndarray]] = {
+            method: {} for method in method_order
+        }
+        method_treatment: Dict[str, Dict[str, np.ndarray]] = {
+            method: {} for method in method_order
+        }
         
         # Find a common sim_id for each scenario that exists for both UD and UNIF methods
         scenario_to_sim_id: Dict[str, int] = {}
         for scenario_name in obs_order:
             # Find sim_ids that exist for both UD and UNIF methods
-            ud_sim_ids = set()
-            unif_sim_ids = set()
+            method_sim_ids = {method: set() for method in method_order}
             for res in raw_results:
                 if res.get("scenario") == scenario_name and res.get("sim_id") is not None:
                     method = res.get("method")
                     sim_id = res.get("sim_id")
-                    if method == "UD":
-                        ud_sim_ids.add(sim_id)
-                    elif method == "UNIF":
-                        unif_sim_ids.add(sim_id)
+                    if method in method_sim_ids:
+                        method_sim_ids[method].add(sim_id)
             # Find common sim_id
-            common_sim_ids = ud_sim_ids & unif_sim_ids
+            common_sim_ids = set.intersection(*method_sim_ids.values()) if method_sim_ids else set()
             if common_sim_ids:
                 scenario_to_sim_id[scenario_name] = min(common_sim_ids)  # Use smallest sim_id
         
@@ -514,17 +532,12 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
                 prop_subsample = prop_full_arr[subsample_idx]
                 treat_subsample = treat_full_arr[subsample_idx]
                 
-                if method == "UD":
-                    if scenario_name not in ud_propensity:
-                        ud_propensity[scenario_name] = prop_subsample
-                        ud_treatment[scenario_name] = treat_subsample
-                elif method == "UNIF":
-                    if scenario_name not in unif_propensity:
-                        unif_propensity[scenario_name] = prop_subsample
-                        unif_treatment[scenario_name] = treat_subsample
+                if method in method_order and scenario_name not in method_propensity[method]:
+                    method_propensity[method][scenario_name] = prop_subsample
+                    method_treatment[method][scenario_name] = treat_subsample
         
-        # Create 3x3 subplot grid
-        fig, axes = plt.subplots(3, len(obs_order), figsize=(6 * len(obs_order), 12), sharey="row", sharex=True)
+        # Full data plus four method rows, with the established visual style.
+        fig, axes = plt.subplots(1 + len(method_order), len(obs_order), figsize=(6 * len(obs_order), 16), sharey="row", sharex=True)
         if len(obs_order) == 1:
             axes = np.expand_dims(axes, axis=1)
         
@@ -557,56 +570,22 @@ def _visualization_reports(raw_results: List[Dict], analysis_dir: Path):
                 ax.set_ylabel("Density")
             ax.grid(True, ls="--", alpha=0.3)
         
-        # Row 2: UD-DML
-        for col, scenario in enumerate(obs_order):
-            ax = axes[1, col]
-            if scenario in ud_propensity:
-                prop = ud_propensity[scenario]
-                treat = ud_treatment[scenario].astype(bool)
-                ax.hist(
-                    prop[treat],
-                    bins=bins,
-                    density=True,
-                    alpha=0.6,
-                    color=colors["Treatment"],
-                )
-                ax.hist(
-                    prop[~treat],
-                    bins=bins,
-                    density=True,
-                    alpha=0.6,
-                    color=colors["Control"],
-                )
-            ax.set_title(f"UD-DML: {scenario}")
-            if col == 0:
-                ax.set_ylabel("Density")
-            ax.grid(True, ls="--", alpha=0.3)
-        
-        # Row 3: UNIF-DML
-        for col, scenario in enumerate(obs_order):
-            ax = axes[2, col]
-            if scenario in unif_propensity:
-                prop = unif_propensity[scenario]
-                treat = unif_treatment[scenario].astype(bool)
-                ax.hist(
-                    prop[treat],
-                    bins=bins,
-                    density=True,
-                    alpha=0.6,
-                    color=colors["Treatment"],
-                )
-                ax.hist(
-                    prop[~treat],
-                    bins=bins,
-                    density=True,
-                    alpha=0.6,
-                    color=colors["Control"],
-                )
-            ax.set_title(f"UNIF-DML: {scenario}")
-            ax.set_xlabel("Propensity score")
-            if col == 0:
-                ax.set_ylabel("Density")
-            ax.grid(True, ls="--", alpha=0.3)
+        for row, method in enumerate(method_order, start=1):
+            for col, scenario in enumerate(obs_order):
+                ax = axes[row, col]
+                if scenario in method_propensity[method]:
+                    prop = method_propensity[method][scenario]
+                    treat = method_treatment[method][scenario].astype(bool)
+                    ax.hist(prop[treat], bins=bins, density=True, alpha=0.6,
+                            color=colors["Treatment"])
+                    ax.hist(prop[~treat], bins=bins, density=True, alpha=0.6,
+                            color=colors["Control"])
+                ax.set_title(f"{method}: {scenario}")
+                if row == len(method_order):
+                    ax.set_xlabel("Propensity score")
+                if col == 0:
+                    ax.set_ylabel("Density")
+                ax.grid(True, ls="--", alpha=0.3)
         
         # Add legend to the first subplot
         handles = [
@@ -624,6 +603,20 @@ def _subsample_size_reports(df: pd.DataFrame, analysis_dir: Path):
     out = summary.copy()
     out["scenario"] = out["scenario"].astype(str)
     out.to_csv(tables_dir / "subsample_size_summary.csv", index=False)
+    (tables_dir / "subsample_size_summary_table.tex").write_text(
+        out.to_latex(
+            index=False,
+            escape=True,
+            float_format=lambda value: f"{value:.4f}",
+            caption=(
+                "Subsample-size experiment summary. RMSE is relative to the "
+                "known simulated ATE; coverage and interval width use the "
+                "variance estimator recorded in the result schema."
+            ),
+            label="tab:subsample_size_summary",
+        ),
+        encoding="utf-8",
+    )
 
     metrics = [("RMSE", "RMSE"), ("CI_Coverage", "CI Coverage"), ("CI_Width", "CI Width")]
     scenarios_present = [sc for sc in SCENARIO_ORDER if not summary[summary["scenario"] == sc].empty]
@@ -703,6 +696,7 @@ def _subsample_size_reports(df: pd.DataFrame, analysis_dir: Path):
     )
     fig.tight_layout()
     _save_figure_multi_format(fig, figures_dir / "subsample_size_metrics")
+    return
 
     # ── Q-Q normality plot (Figure 3) ──
     # Uses all replications at the LARGEST r_total for OBS-3.
@@ -810,7 +804,7 @@ def _population_size_reports(
     metrics = ["RMSE", "CI_Coverage", "CI_Width", "Runtime"]
     
     # Extract r_totals only from UD/UNIF methods to avoid FULL's population_size values
-    non_full_summary = summary[summary["method"].isin(["UD", "UNIF"])]
+    non_full_summary = summary[summary["method"] != "FULL"]
     if non_full_summary.empty:
         r_totals = sorted(summary["r_total"].dropna().unique())
     else:
@@ -1477,6 +1471,95 @@ def _nuisance_sensitivity_reports(
 # =============================================================================
 
 
+def _plot_overlap_gradient_summary(
+    summary: pd.DataFrame,
+    figures_dir: Path,
+    allowed_methods: Iterable[str] | None = None,
+) -> None:
+    """Plot overlap-gradient accuracy and coverage without amplifying MC noise."""
+    methods_present = _methods_present(summary, allowed_methods)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 5.2))
+
+    for method in methods_present:
+        mdf = summary[summary["method"] == method].sort_values("overlap_strength")
+        ax1.plot(
+            mdf["overlap_strength"], mdf["RMSE"],
+            marker=_get_method_marker(method),
+            color=METHOD_COLORS.get(method, "#444"),
+            label=method, linewidth=2.4, markersize=8,
+        )
+    ax1.set_xlabel("Overlap strength $c$")
+    ax1.set_ylabel("RMSE")
+    ax1.set_title("(a) Estimation error", loc="left")
+    ax1.grid(True, axis="y", ls="--")
+
+    offsets = np.linspace(-0.027, 0.027, max(len(methods_present), 1))
+    nominal_trials = int(round(float(summary["Replications"].median())))
+    nominal_successes = int(round(0.95 * nominal_trials))
+    nominal_low, nominal_high = _wilson_interval(
+        nominal_successes, nominal_trials
+    )
+    ax2.axhspan(
+        nominal_low, nominal_high, color="0.88", alpha=0.65,
+        label="95% MC band under nominal coverage", zorder=0,
+    )
+    ax2.axhline(
+        0.95, ls=":", color="0.25", linewidth=1.8,
+        label="Nominal 0.95", zorder=1,
+    )
+    for offset, method in zip(offsets, methods_present):
+        mdf = summary[summary["method"] == method].sort_values("overlap_strength")
+        coverage = mdf["CI_Coverage"].to_numpy(dtype=float)
+        replications = mdf["Replications"].to_numpy(dtype=int)
+        intervals = [
+            _wilson_interval(int(round(p * n)), int(n))
+            for p, n in zip(coverage, replications)
+        ]
+        lower = np.array([p - interval[0] for p, interval in zip(coverage, intervals)])
+        upper = np.array([interval[1] - p for p, interval in zip(coverage, intervals)])
+        ax2.errorbar(
+            mdf["overlap_strength"].to_numpy(dtype=float) + offset,
+            coverage,
+            yerr=np.vstack([lower, upper]),
+            linestyle="none",
+            marker=_get_method_marker(method),
+            color=METHOD_COLORS.get(method, "#444"),
+            label=method,
+            markersize=7.5,
+            elinewidth=1.5,
+            capsize=3,
+            capthick=1.3,
+            zorder=3,
+        )
+    ax2.set_xlabel("Overlap strength $c$")
+    ax2.set_ylabel("Empirical coverage")
+    ax2.set_title("(b) Coverage with Monte Carlo uncertainty", loc="left")
+    ax2.set_ylim(0.90, 1.00)
+    ax2.set_yticks([0.90, 0.925, 0.95, 0.975, 1.00])
+    ax2.grid(True, axis="y", ls="--")
+
+    legend_handles = [
+        Line2D(
+            [], [], marker=_get_method_marker(method), linestyle="-",
+            color=METHOD_COLORS.get(method, "#444"), label=method,
+            linewidth=2.2, markersize=7,
+        )
+        for method in methods_present
+    ]
+    legend_handles.extend([
+        Line2D([], [], color="0.25", linestyle=":", linewidth=1.8,
+               label="Nominal 0.95"),
+        Patch(facecolor="0.88", edgecolor="none", alpha=0.65,
+              label="95% MC band under nominal coverage"),
+    ])
+    fig.legend(
+        handles=legend_handles, loc="lower center", ncol=3,
+        frameon=False, bbox_to_anchor=(0.5, -0.03),
+    )
+    fig.tight_layout(rect=[0, 0.14, 1, 1])
+    _save_figure_multi_format(fig, figures_dir / "overlap_gradient")
+
+
 def _overlap_gradient_reports(
     df: pd.DataFrame,
     analysis_dir: Path,
@@ -1506,61 +1589,28 @@ def _overlap_gradient_reports(
 
     # ── Figure 2: 2-panel ──
     c_vals = sorted(summary["overlap_strength"].dropna().unique())
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    for method in methods_present:
-        mdf = summary[summary["method"] == method].sort_values("overlap_strength")
-        ax1.plot(
-            mdf["overlap_strength"], mdf["RMSE"],
-            marker=_get_method_marker(method),
-            color=METHOD_COLORS.get(method, "#444"),
-            label=method, linewidth=2.4, markersize=8,
-        )
-    ax1.set_xlabel("Overlap strength $c$")
-    ax1.set_ylabel("RMSE")
-    ax1.set_title("RMSE vs overlap severity")
-    ax1.legend()
-    ax1.grid(True, ls="--")
-
-    # RMSE ratio UNIF/UD
-    if "UD" in methods_present and "UNIF" in methods_present:
-        ud = summary[summary["method"] == "UD"].set_index("overlap_strength")["RMSE"]
-        unif = summary[summary["method"] == "UNIF"].set_index("overlap_strength")["RMSE"]
-        ratio = (unif / ud).dropna()
-        ax2.plot(
-            ratio.index, ratio.values,
-            "s-", color="#333333", linewidth=2.4, markersize=8,
-        )
-        ax2.axhline(1.0, ls=":", color="gray", alpha=0.7)
-        ax2.set_xlabel("Overlap strength $c$")
-        ax2.set_ylabel("RMSE ratio (UNIF / UD)")
-        ax2.set_title("UD-DML advantage ratio")
-        ax2.grid(True, ls="--")
-
-    fig.tight_layout()
-    _save_figure_multi_format(fig, figures_dir / "overlap_gradient")
-
+    _plot_overlap_gradient_summary(summary, figures_dir, methods_present)
     # ── LaTeX Table 1 (overlap gradient) ──
     tex_lines = [
         r"\begin{table}[htbp]",
         r"\centering",
         r"\caption{Overlap gradient experiment. RMSE, CI Coverage, and CI Width "
-        r"for UD-DML and UNIF-DML as the propensity coefficient strength $c$ varies "
+        r"for all four working-sample methods as the propensity coefficient strength $c$ varies "
         r"from near-perfect overlap ($c=0.1$) to extreme confounding ($c=1.5$). "
         r"OBS-3 structure, $n=5\times10^5$, $r=5000$, $B=500$ replications.}",
         r"\label{tab:overlap_gradient}",
         r"\setlength{\tabcolsep}{5pt}",
-        r"\begin{tabular}{lrrrrrr}",
+        r"\begin{tabular}{lrrrrrrrrrrrr}",
         r"\toprule",
-        r" & \multicolumn{2}{c}{RMSE} & \multicolumn{2}{c}{CI Coverage} & \multicolumn{2}{c}{CI Width} \\",
-        r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}",
-        r"$c$ & UD & UNIF & UD & UNIF & UD & UNIF \\",
+        r" & \multicolumn{4}{c}{RMSE} & \multicolumn{4}{c}{CI Coverage} & \multicolumn{4}{c}{CI Width} \\",
+        r"\cmidrule(lr){2-5}\cmidrule(lr){6-9}\cmidrule(lr){10-13}",
+        r"$c$ & UNIF & STRAT & SEP-UD & UD & UNIF & STRAT & SEP-UD & UD & UNIF & STRAT & SEP-UD & UD \\",
         r"\midrule",
     ]
     for c_val in c_vals:
         row_parts = [f"{c_val:.1f}"]
         for metric in ["RMSE", "CI_Coverage", "CI_Width"]:
-            for method in ["UD", "UNIF"]:
+            for method in ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"]:
                 val = summary[
                     (summary["overlap_strength"] == c_val) &
                     (summary["method"] == method)
@@ -1599,8 +1649,8 @@ def _normality_and_balance_reports(
     if obs3.empty:
         obs3 = df  # fall back to whatever is available
 
-    for method_filter in [["UD", "UNIF"]]:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    for method_filter in [["UNIF", "STRAT-UNIF", "SEP-UD", "UD"]]:
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4.3))
         for idx, method in enumerate(method_filter):
             ax = axes[idx]
             mdf = obs3[obs3["method"] == method]
@@ -1657,12 +1707,13 @@ def _normality_and_balance_reports(
         scen = res.get("scenario", "")
         meth = res.get("method", "")
         si = res.get("subsample_indices")
-        if scen in obs_scenarios and meth in ("UD", "UNIF") and si is not None:
+        if scen in obs_scenarios and meth in ("UNIF", "STRAT-UNIF", "SEP-UD", "UD") and si is not None:
             idx_map.setdefault(scen, {})[meth] = np.asarray(si)
 
     # Only plot scenarios where both UD and UNIF indices exist
+    balance_methods = ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"]
     plot_scenarios = [s for s in obs_scenarios
-                      if s in idx_map and "UD" in idx_map[s] and "UNIF" in idx_map[s]]
+                      if s in idx_map and all(m in idx_map[s] for m in balance_methods)]
     if not plot_scenarios:
         return
 
@@ -1692,14 +1743,14 @@ def _normality_and_balance_reports(
             idx_safe = indices[indices < _X.shape[0]]
             return np.abs(_X[idx_safe].mean(axis=0) - _mu) / _sd
 
-        smd_ud = _smd(idx_map[scen]["UD"])
-        smd_unif = _smd(idx_map[scen]["UNIF"])
-
         y_pos = np.arange(p_dim)
-        ax.scatter(smd_unif, y_pos, marker="s", s=60, color=METHOD_COLORS["UNIF"],
-                   label="UNIF-DML" if col == 0 else None, zorder=3)
-        ax.scatter(smd_ud, y_pos, marker="o", s=60, color=METHOD_COLORS["UD"],
-                   label="UD-DML" if col == 0 else None, zorder=3)
+        for method in balance_methods:
+            ax.scatter(
+                _smd(idx_map[scen][method]), y_pos,
+                marker=_get_method_marker(method), s=52,
+                color=METHOD_COLORS[method],
+                label=method if col == 0 else None, zorder=3,
+            )
         ax.axvline(0.1, ls=":", color="gray", alpha=0.7,
                    label="SMD = 0.1" if col == 0 else None)
         ax.set_title(scen)
@@ -1717,6 +1768,215 @@ def _normality_and_balance_reports(
     _save_figure_multi_format(fig, figures_dir / "smd_love_plot")
 
 
+def _wilson_interval(successes: int, trials: int, z: float = 1.96) -> tuple[float, float]:
+    if trials <= 0:
+        return np.nan, np.nan
+    proportion = successes / trials
+    denominator = 1.0 + z * z / trials
+    centre = (proportion + z * z / (2.0 * trials)) / denominator
+    half_width = (
+        z
+        * math.sqrt(
+            proportion * (1.0 - proportion) / trials
+            + z * z / (4.0 * trials * trials)
+        )
+        / denominator
+    )
+    return centre - half_width, centre + half_width
+
+
+def _diagnostic_baseline_reports(
+    df: pd.DataFrame,
+    raw_results: List[Dict],
+    analysis_dir: Path,
+) -> None:
+    """Produce the reviewer-facing four-stage ablation evidence package."""
+    tables_dir, figures_dir = _ensure_directories(analysis_dir)
+    method_order = ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"]
+    success = (
+        df[df["method"].isin(method_order)].copy()
+        if "method" in df.columns
+        else pd.DataFrame()
+    )
+
+    failure_records = []
+    for result in raw_results:
+        failure_records.append(
+            {
+                "scenario": result.get("scenario"),
+                "method": result.get("method"),
+                "sim_id": result.get("sim_id"),
+                "status": result.get("status", "success"),
+                "error_type": result.get("error_type"),
+                "error_message": result.get("error_message"),
+            }
+        )
+    failure_df = pd.DataFrame(failure_records)
+    if not failure_df.empty:
+        failure_df.to_csv(tables_dir / "ablation_run_status.csv", index=False)
+        failure_summary = (
+            failure_df.assign(failed=failure_df["status"].ne("success").astype(int))
+            .groupby(["scenario", "method"], observed=False)
+            .agg(Attempts=("sim_id", "count"), Failures=("failed", "sum"))
+            .reset_index()
+        )
+        failure_summary["Failure_Rate"] = (
+            failure_summary["Failures"] / failure_summary["Attempts"]
+        )
+        failure_summary.to_csv(tables_dir / "ablation_failure_summary.csv", index=False)
+
+    if success.empty:
+        return
+
+    rows = []
+    for (scenario, method), group in success.groupby(
+        ["scenario", "method"], observed=False
+    ):
+        if group.empty:
+            continue
+        coverage_values = group["CI_Coverage"].dropna()
+        covered = int(coverage_values.sum())
+        coverage_n = int(coverage_values.size)
+        cov_low, cov_high = _wilson_interval(covered, coverage_n)
+        empirical_se = float(group["est_ate"].std(ddof=1))
+        mean_model_se = float(group["standard_error"].mean())
+        rows.append(
+            {
+                "Scenario": str(scenario),
+                "Method": method,
+                "Replications": int(group.shape[0]),
+                "Bias": float(group["Bias"].mean()),
+                "RMSE": float(np.sqrt(group["Sq_Error"].mean())),
+                "Coverage": float(coverage_values.mean()),
+                "Coverage_Wilson_Lower": cov_low,
+                "Coverage_Wilson_Upper": cov_high,
+                "Mean_CI_Width": float(group["CI_Width"].mean()),
+                "Empirical_SE": empirical_se,
+                "Mean_Model_SE": mean_model_se,
+                "Empirical_to_Model_SE": (
+                    empirical_se / mean_model_se if mean_model_se > 0.0 else np.nan
+                ),
+                "Mean_Runtime_s": float(group["runtime"].mean()),
+                "Median_Runtime_s": float(group["runtime"].median()),
+                "Mean_SMD": float(group["smd_mean"].mean()),
+                "Mean_Max_SMD": float(group["smd_max"].mean()),
+                "Mean_GEFD": float(group["gefd_estimate"].mean()),
+                "Mean_Match_Radius": float(group["matching_mean_distance"].mean()),
+                "Mean_Max_Match_Radius": float(group["matching_max_distance"].mean()),
+                "Variance_Method": ";".join(
+                    sorted(set(group["variance_method"].dropna().astype(str)))
+                ),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    summary["Method"] = pd.Categorical(
+        summary["Method"], categories=method_order, ordered=True
+    )
+    summary = summary.sort_values(["Scenario", "Method"])
+    summary.to_csv(tables_dir / "ablation_summary.csv", index=False)
+
+    transitions = [
+        ("UNIF", "STRAT-UNIF"),
+        ("STRAT-UNIF", "SEP-UD"),
+        ("SEP-UD", "UD"),
+    ]
+    paired_rows = []
+    for scenario in success["scenario"].dropna().unique():
+        scenario_df = success[success["scenario"] == scenario]
+        squared_error = scenario_df.pivot_table(
+            index="sim_id", columns="method", values="Sq_Error", aggfunc="first"
+        )
+        for previous, current in transitions:
+            if previous not in squared_error or current not in squared_error:
+                continue
+            differences = (
+                squared_error[current] - squared_error[previous]
+            ).dropna()
+            paired_rows.append(
+                {
+                    "Scenario": str(scenario),
+                    "Transition": f"{previous} -> {current}",
+                    "Pairs": int(differences.size),
+                    "Mean_Change_in_Squared_Error": float(differences.mean()),
+                    "MCSE": float(differences.std(ddof=1) / math.sqrt(differences.size))
+                    if differences.size > 1
+                    else np.nan,
+                }
+            )
+    paired_table = pd.DataFrame(paired_rows)
+    paired_table.to_csv(
+        tables_dir / "ablation_paired_differences.csv", index=False
+    )
+    if not paired_table.empty:
+        (tables_dir / "ablation_paired_differences_table.tex").write_text(
+            paired_table.to_latex(
+                index=False,
+                escape=True,
+                float_format=lambda value: f"{value:.5f}",
+                caption=(
+                    "Paired changes in squared error for adjacent stages of "
+                    "the four-method ablation. Negative values favour the "
+                    "later stage."
+                ),
+                label="tab:ablation_paired_differences",
+            ),
+            encoding="utf-8",
+        )
+
+    compact_columns = [
+        "Scenario",
+        "Method",
+        "RMSE",
+        "Coverage",
+        "Mean_CI_Width",
+        "Mean_SMD",
+        "Mean_Runtime_s",
+    ]
+    tex_table = summary[compact_columns].copy()
+    tex_table["Method"] = tex_table["Method"].astype(str)
+    (tables_dir / "ablation_performance_table.tex").write_text(
+        tex_table.to_latex(
+            index=False,
+            escape=True,
+            float_format=lambda value: f"{value:.4f}",
+            caption=(
+                "Four-stage ablation under a common subsample budget. "
+                "Methods share the generated population within each Monte Carlo "
+                "replication."
+            ),
+            label="tab:ablation_performance",
+        ),
+        encoding="utf-8",
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8), sharey=False)
+    for axis, metric, ylabel in zip(
+        axes,
+        ["Mean_SMD", "Mean_Max_SMD"],
+        ["Mean absolute SMD", "Maximum absolute SMD"],
+    ):
+        for method in method_order:
+            method_rows = summary[summary["Method"] == method]
+            if method_rows.empty:
+                continue
+            x = np.arange(method_rows.shape[0])
+            axis.plot(
+                x,
+                method_rows[metric],
+                marker=METHOD_DEFAULT_MARKERS[method],
+                color=METHOD_COLORS[method],
+                label=method,
+            )
+        scenarios = list(dict.fromkeys(summary["Scenario"].astype(str)))
+        axis.set_xticks(np.arange(len(scenarios)), scenarios)
+        axis.set_ylabel(ylabel)
+        axis.grid(True, axis="y", linestyle="--", alpha=0.35)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.88])
+    _save_figure_multi_format(fig, figures_dir / "ablation_balance")
+
+
 # =============================================================================
 # Public entry point
 # =============================================================================
@@ -1724,17 +1984,23 @@ def _normality_and_balance_reports(
 
 def generate_reports(exp_name: str, results: List[Dict], output_dir: Path) -> Dict[str, Path]:
     folder_name = exp_name.replace("experiment_", "", 1) if exp_name.startswith("experiment_") else exp_name
-    analysis_dir = Path("./analysis_results") / folder_name
+    _, _, experiments = config.get_experiments()
+    configured_output = Path(experiments.get(exp_name, {}).get("base_dir", output_dir))
+    actual_output = Path(output_dir)
+    analysis_folder = (
+        folder_name
+        if actual_output.name == configured_output.name
+        else actual_output.name
+    )
+    analysis_dir = Path("./analysis_results") / analysis_folder
     tables_dir, figures_dir = _ensure_directories(analysis_dir)
 
     df = prepare_dataframe(results)
-    _, _, experiments = config.get_experiments()
     allowed_methods = experiments.get(exp_name, {}).get("methods")
     allowed_scenarios = experiments.get(exp_name, {}).get("scenarios")
 
     if exp_name == "experiment_visualization":
         _visualization_reports(results, analysis_dir)
-        _normality_and_balance_reports(df, results, analysis_dir)
     elif exp_name == "experiment_subsample_size":
         _subsample_size_reports(df, analysis_dir)
     elif exp_name == "experiment_overlap_gradient":
@@ -1743,6 +2009,8 @@ def generate_reports(exp_name: str, results: List[Dict], output_dir: Path) -> Di
         _population_size_reports(df, analysis_dir, allowed_methods, allowed_scenarios)
     elif exp_name == "experiment_double_robust":
         _double_robust_reports(df, analysis_dir, allowed_methods, allowed_scenarios)
+    elif exp_name == "experiment_diagnostic_baselines":
+        _diagnostic_baseline_reports(df, results, analysis_dir)
     else:
         if not df.empty:
             df.to_csv(tables_dir / "raw_results.csv", index=False)

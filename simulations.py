@@ -33,6 +33,8 @@ import traceback
 import gzip
 import os
 import math
+import zlib
+import threading
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -187,8 +189,19 @@ import methods
 # =============================================================================
 
 FAST_DEMO_MODE = False
+RESULT_SCHEMA_VERSION = 3
+SUBSAMPLE_METHODS = frozenset({"UD", "UNIF", "STRAT-UNIF", "SEP-UD"})
+UD_BASED_METHODS = frozenset({"UD", "SEP-UD"})
+EXPERIMENT_FAMILY_OVERRIDES = {
+    "n_replications": None,
+    "population_size": None,
+    "r_total": None,
+}
+EXPERIMENT_OUTPUT_TAG: Optional[str] = None
 FAST_DEMO_OVERRIDES = {
-    "n_replications": 10,
+    "n_replications": 2,
+    "population_size": 5_000,
+    "r_total": 500,
 }
 # Standalone UD profiling experiments (efficiency_profile, bgamma_sensitivity): full scale,
 # replications = ADDON_EXPERIMENT_REPLICATIONS_FULL in normal runs and FAST_DEMO_OVERRIDES["n_replications"] in --fast-demo.
@@ -276,6 +289,84 @@ def _format_mem_postfix() -> Optional[str]:
     return f"rss={rss / (1024 ** 3):4.1f}GB"
 
 
+def _current_rss_bytes() -> int:
+    """Return current resident-set size without requiring psutil."""
+    if _PSUTIL_PROC is not None:
+        return int(_PSUTIL_PROC.memory_info().rss)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCountersEx(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCountersEx()
+        counters.cb = ctypes.sizeof(counters)
+        get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+        get_current_process.argtypes = []
+        get_current_process.restype = wintypes.HANDLE
+        get_process_memory_info = ctypes.windll.psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCountersEx),
+            wintypes.DWORD,
+        ]
+        get_process_memory_info.restype = wintypes.BOOL
+        process = get_current_process()
+        ok = get_process_memory_info(
+            process, ctypes.byref(counters), counters.cb
+        )
+        return int(counters.WorkingSetSize) if ok else 0
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        with open("/proc/self/statm", "r", encoding="ascii") as handle:
+            resident_pages = int(handle.read().split()[1])
+        return int(resident_pages * page_size)
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+class _PeakRSSMonitor:
+    """Poll process RSS around one representative estimator invocation."""
+
+    def __init__(self, interval_seconds: float = 0.02):
+        self.interval_seconds = interval_seconds
+        self.baseline_bytes = 0
+        self.peak_bytes = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        self.baseline_bytes = _current_rss_bytes()
+        self.peak_bytes = self.baseline_bytes
+
+        def sample() -> None:
+            while not self._stop.wait(self.interval_seconds):
+                self.peak_bytes = max(self.peak_bytes, _current_rss_bytes())
+
+        self._thread = threading.Thread(target=sample, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_object):
+        self.peak_bytes = max(self.peak_bytes, _current_rss_bytes())
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+
 def _update_tqdm_postfix(
     bar: "tqdm",
     result: Optional[dict],
@@ -337,7 +428,10 @@ def _sanitize_token(token):
 
 
 def _trim_for_fast_demo(values):
-    return list(values)
+    values = list(values)
+    if FAST_DEMO_MODE and values:
+        return values[:1]
+    return values
 
 
 def _apply_fast_demo_overrides(variant):
@@ -347,12 +441,55 @@ def _apply_fast_demo_overrides(variant):
         variant.get("n_replications", config.DEFAULT_REPLICATIONS),
         FAST_DEMO_OVERRIDES["n_replications"],
     )
+    variant["population_size"] = min(
+        int(variant.get("population_size", config.N_POPULATION)),
+        FAST_DEMO_OVERRIDES["population_size"],
+    )
+    if variant.get("r_total") is not None:
+        variant["r_total"] = min(
+            int(variant["r_total"]),
+            FAST_DEMO_OVERRIDES["r_total"],
+        )
     return variant
+
+
+def _apply_experiment_family_overrides(variant):
+    """Apply explicit CLI overrides to a generated experiment-family variant."""
+    variant = variant.copy()
+    replications = EXPERIMENT_FAMILY_OVERRIDES.get("n_replications")
+    population_size = EXPERIMENT_FAMILY_OVERRIDES.get("population_size")
+    r_total = EXPERIMENT_FAMILY_OVERRIDES.get("r_total")
+    if replications is not None:
+        variant["n_replications"] = int(replications)
+    if population_size is not None:
+        variant["population_size"] = int(population_size)
+    if r_total is not None and variant.get("r_total") is not None:
+        variant["r_total"] = int(r_total)
+    return variant
+
+
+def _resolve_experiment_output_dir(base_dir):
+    """Return an isolated output directory for demo or tagged validation runs."""
+    base_dir = Path(base_dir)
+    tag = EXPERIMENT_OUTPUT_TAG
+    if tag is None and FAST_DEMO_MODE:
+        tag = "demo"
+    if tag is None:
+        return base_dir
+    clean_tag = str(tag).strip()
+    if not clean_tag or any(
+        not (character.isalnum() or character == "_")
+        for character in clean_tag
+    ):
+        raise ValueError(
+            "Experiment output tag may contain only letters, numbers, and underscores."
+        )
+    return base_dir.parent / f"{base_dir.name}_{clean_tag}"
 
 
 def _prepare_sampling_config(method_name, variant, scenario_name):
     r_total = variant.get("r_total")
-    if method_name in ("UD", "UNIF"):
+    if method_name in SUBSAMPLE_METHODS:
         if r_total is None:
             raise ValueError(f"{method_name} requires 'r_total' in variant configuration.")
     else:  # FULL method
@@ -376,7 +513,11 @@ def _resolve_ud_cache_seed(scenario_name, variant, sampling_cfg):
 
 
 def _compose_variant_label(method_name, variant, sampling_cfg):
-    parts = [variant.get("label", "baseline")]
+    parts = [variant.get("label", "baseline"), f"schema{RESULT_SCHEMA_VERSION}"]
+    if sampling_cfg.get("r_total") is not None:
+        parts.append(f"r{int(sampling_cfg['r_total'])}")
+    if variant.get("population_size") is not None:
+        parts.append(f"n{int(variant['population_size'])}")
     if variant.get("misspecification"):
         parts.append(variant["misspecification"])
     if variant.get("learner"):
@@ -440,7 +581,7 @@ def _generate_variant_blueprints(exp_name, exp_config):
                         "label": f"N-{int(population)}_r-{int(r_total)}",
                         "population_size": int(population),
                         "r_total": int(r_total),
-                        "method_whitelist": {"UD", "UNIF"},
+                        "method_whitelist": {"UNIF", "STRAT-UNIF", "SEP-UD", "UD"},
                     }
                 )
                 variants.append(_apply_fast_demo_overrides(variant))
@@ -471,7 +612,7 @@ def _generate_variant_blueprints(exp_name, exp_config):
         variant["label"] = "default"
         variants.append(_apply_fast_demo_overrides(variant))
 
-    return variants
+    return [_apply_experiment_family_overrides(variant) for variant in variants]
 
 
 # =============================================================================
@@ -549,8 +690,15 @@ def _get_or_generate_data(scenario_cfg, scenario_name, sim_id, variant):
         return _WORKER_DATA_CACHE[1], data_params
     # Evict prior cache (only hold one dataset at a time to bound RAM).
     _WORKER_DATA_CACHE = None
-    np.random.seed(config.BASE_SEED + int(sim_id))
+    scenario_code = int(zlib.crc32(scenario_name.encode("utf-8")) & 0xFFFFFFFF)
+    data_seed = int(
+        np.random.SeedSequence(
+            [int(config.BASE_SEED), int(sim_id), scenario_code]
+        ).generate_state(1, dtype=np.uint32)[0]
+    )
+    np.random.seed(data_seed)
     data = scenario_cfg["data_gen_func"](**data_params)
+    data["data_seed"] = data_seed
     _WORKER_DATA_CACHE = (key, data)
     return data, data_params
 
@@ -595,10 +743,9 @@ def run_single_replication(task):
             method_kwargs["misspecification"] = variant["misspecification"]
         if variant.get("store_sample"):
             method_kwargs["store_sample"] = True
-
-        if method_name in ("UD", "UNIF"):
+        if method_name in SUBSAMPLE_METHODS:
             method_kwargs["r"] = {"r_total": sampling_cfg["r_total"]}
-        if method_name == "UD":
+        if method_name in UD_BASED_METHODS:
             method_kwargs["cache_seed"] = _resolve_ud_cache_seed(
                 scenario_name, variant, sampling_cfg
             )
@@ -630,6 +777,10 @@ def run_single_replication(task):
             "learner": learner,
             "store_sample": variant.get("store_sample", False),
             "covariates": scenario_cfg.get("covariates", "x1"),
+            "result_schema_version": RESULT_SCHEMA_VERSION,
+            "data_seed": data.get("data_seed"),
+            "rng_scheme": "SeedSequence(BASE_SEED, sim_id, crc32(scenario))",
+            "status": "success",
         }
         if variant.get("overlap_strength") is not None:
             metadata["overlap_strength"] = float(variant["overlap_strength"])
@@ -638,7 +789,7 @@ def run_single_replication(task):
 
         result.update(metadata)
 
-        if isinstance(metadata.get("store_sample"), bool) and metadata["store_sample"] and method_name in ("UD", "UNIF"):
+        if isinstance(metadata.get("store_sample"), bool) and metadata["store_sample"] and method_name in SUBSAMPLE_METHODS:
             cov_key = metadata["covariates"]
             dims_map = {"x1": (0, 1), "x2": (0, 5), "x3": (0, 5)}
             dims = dims_map.get(cov_key, (0, 1))
@@ -652,7 +803,7 @@ def run_single_replication(task):
         if (
             isinstance(metadata.get("store_sample"), bool)
             and metadata["store_sample"]
-            and method_name in ("UD", "UNIF")
+            and method_name in SUBSAMPLE_METHODS
             and metadata.get("scenario", "").startswith("OBS")
         ):
             result["propensity_full"] = np.asarray(data["pi_true"], dtype=np.float32)
@@ -682,7 +833,21 @@ def run_single_replication(task):
             f"{variant.get('label', 'variant')}): {exc}"
         )
         traceback.print_exc()
-        return None
+        return {
+            "exp_name": exp_name,
+            "scenario": scenario_name,
+            "method": method_name,
+            "sim_id": sim_id,
+            "r_total": sampling_cfg.get("r_total"),
+            "population_size": variant.get("population_size", config.N_POPULATION),
+            "variant_label": _compose_variant_label(
+                method_name, variant, sampling_cfg
+            ),
+            "result_schema_version": RESULT_SCHEMA_VERSION,
+            "status": "failure",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc)[:1000],
+        }
 
 
 def _try_load_checkpoint_result(task):
@@ -774,7 +939,13 @@ def _task_sort_key(task):
     r_total = -1 if r_total is None else int(r_total)
     overlap = variant.get("overlap_strength")
     overlap_key = -1.0 if overlap is None else float(overlap)
-    method_rank = {"UD": 0, "FULL": 1, "UNIF": 2}.get(method_name, 9)
+    method_rank = {
+        "UD": 0,
+        "STRAT-UNIF": 1,
+        "SEP-UD": 2,
+        "FULL": 3,
+        "UNIF": 4,
+    }.get(method_name, 9)
     return (
         -_task_population(task),          # heavy jobs first (pop-desc)
         scenario_name,                    # group by scenario
@@ -992,11 +1163,124 @@ PROFILE_STEP_LABELS_TEX: dict = {
     "inference": r"Inference",
 }
 
+PROFILE_STEP_LABELS_PLOT: dict = {
+    "standardize_pca": "Standardise + PCA",
+    "ecdf_sort": "ECDF sort",
+    "design_search": "Design search",
+    "inverse_cdf_map": "Inverse-CDF map",
+    "kd_build": "Tree build",
+    "matching": "Matching",
+    "dml": "Nuisance fitting",
+    "inference": "Inference",
+}
+
 
 def _require_columns(row: dict, required: set, context: str) -> None:
     missing = required.difference(row.keys())
     if missing:
         raise KeyError(f"{context}: missing columns {sorted(missing)}")
+
+
+def build_computation_tuning_composite(
+    efficiency_dir: Path,
+    bgamma_dir: Path,
+) -> Path:
+    """Combine the two B_gamma diagnostics above a full-width time-share panel."""
+    shares_path = efficiency_dir / "profile_shares.csv"
+    bgamma_path = bgamma_dir / "bgamma_sensitivity_summary.csv"
+    if not shares_path.exists():
+        raise FileNotFoundError(f"Missing efficiency profile: {shares_path}")
+    if not bgamma_path.exists():
+        raise FileNotFoundError(f"Missing B_gamma summary: {bgamma_path}")
+
+    with shares_path.open(newline="", encoding="utf-8") as stream:
+        share_rows = list(csv.DictReader(stream))
+    with bgamma_path.open(newline="", encoding="utf-8") as stream:
+        bgamma_rows = list(csv.DictReader(stream))
+    if not share_rows or not bgamma_rows:
+        raise ValueError("Composite computation figure requires non-empty input CSVs.")
+
+    xs = np.array([int(row["B_gamma"]) for row in bgamma_rows], dtype=int)
+    mean_runtime = np.array([float(row["mean_runtime"]) for row in bgamma_rows])
+    median_runtime = np.array([float(row["median_runtime"]) for row in bgamma_rows])
+    rmse = np.array([float(row["rmse"]) for row in bgamma_rows])
+    coverage = np.array([float(row["coverage_95"]) for row in bgamma_rows])
+
+    share_matrix = np.array(
+        [[100.0 * float(row[key]) for key in PROFILE_STEP_KEYS] for row in share_rows],
+        dtype=float,
+    )
+    share_median = np.median(share_matrix, axis=0)
+    share_q1 = np.percentile(share_matrix, 25, axis=0)
+    share_q3 = np.percentile(share_matrix, 75, axis=0)
+
+    ud_color = "#D55E00"
+    reference_color = "#009E73"
+    fig = plt.figure(figsize=(12, 8.5))
+    grid = fig.add_gridspec(2, 2, height_ratios=(1.0, 1.15), hspace=0.42, wspace=0.34)
+    ax_runtime = fig.add_subplot(grid[0, 0])
+    ax_precision = fig.add_subplot(grid[0, 1])
+    ax_shares = fig.add_subplot(grid[1, :])
+
+    ax_runtime.plot(xs, mean_runtime, "o-", color=ud_color,
+                    linewidth=2.4, markersize=8, label="Mean")
+    ax_runtime.plot(xs, median_runtime, "s--", color=ud_color, alpha=0.70,
+                    linewidth=2.4, markersize=8, label="Median")
+    ax_runtime.set_xlabel(r"$B_\gamma$")
+    ax_runtime.set_ylabel("Runtime (s)")
+    ax_runtime.set_title("Runtime vs generator budget")
+    ax_runtime.legend(loc="best")
+    ax_runtime.grid(True, ls="--", alpha=0.6)
+
+    ax_precision.plot(xs, rmse, "o-", color=ud_color,
+                      linewidth=2.4, markersize=8, label="RMSE")
+    ax_coverage = ax_precision.twinx()
+    ax_coverage.plot(xs, coverage, "s--", color=reference_color,
+                     linewidth=2.4, markersize=8, label="Coverage")
+    ax_precision.set_xlabel(r"$B_\gamma$")
+    ax_precision.set_ylabel("RMSE", color=ud_color)
+    ax_coverage.set_ylabel("Coverage", color=reference_color)
+    ax_precision.tick_params(axis="y", labelcolor=ud_color)
+    ax_coverage.tick_params(axis="y", labelcolor=reference_color)
+    ax_precision.set_title(r"Precision metrics vs $B_\gamma$")
+    handles_left, labels_left = ax_precision.get_legend_handles_labels()
+    handles_right, labels_right = ax_coverage.get_legend_handles_labels()
+    ax_precision.legend(handles_left + handles_right, labels_left + labels_right, loc="best")
+    ax_precision.grid(True, ls="--", alpha=0.6)
+
+    positions = np.arange(len(PROFILE_STEP_KEYS))
+    errors = np.vstack((share_median - share_q1, share_q3 - share_median))
+    ax_shares.bar(
+        positions,
+        share_median,
+        yerr=errors,
+        color=ud_color,
+        alpha=0.78,
+        edgecolor="black",
+        linewidth=0.8,
+        capsize=4,
+    )
+    ax_shares.set_xticks(positions)
+    ax_shares.set_xticklabels(
+        [PROFILE_STEP_LABELS_PLOT[key] for key in PROFILE_STEP_KEYS],
+        rotation=18,
+        ha="right",
+    )
+    positive = share_matrix[share_matrix > 0]
+    if positive.size and positive.max() / positive.min() > 100:
+        ax_shares.set_yscale("log")
+        ax_shares.set_ylabel("Median time share (%, log scale)")
+    else:
+        ax_shares.set_ylabel("Median time share (%)")
+    ax_shares.set_title("Component time shares; bars show medians and IQRs")
+    ax_shares.grid(True, axis="y", which="both", ls="--", alpha=0.6)
+
+    fig.tight_layout()
+    output = bgamma_dir / "computation_tuning_composite"
+    fig.savefig(output.with_suffix(".png"), dpi=300)
+    fig.savefig(output.with_suffix(".pdf"))
+    plt.close(fig)
+    return output.with_suffix(".pdf")
 
 
 def run_efficiency_profile_experiment(
@@ -1025,7 +1309,12 @@ def run_efficiency_profile_experiment(
         "n",
         "r_total",
         "B_gamma",
-    ] + PROFILE_STEP_KEYS + ["total"]
+    ] + PROFILE_STEP_KEYS + [
+        "total",
+        "rss_before_mb",
+        "peak_rss_mb",
+        "incremental_peak_rss_mb",
+    ]
 
     rows = []
     B_gamma = int(getattr(config, "UD_MAX_GENERATOR_CANDIDATES", 30))
@@ -1040,18 +1329,19 @@ def run_efficiency_profile_experiment(
         data_params = dict(scenario_cfg["params"])
         data_params["n"] = int(n)
         data = scenario_cfg["data_gen_func"](**data_params)
-        out = methods.run_ud(
-            data["X"],
-            data["W"],
-            data["Y_obs"],
-            data["pi_true"],
-            scenario_cfg["design"] == "rct",
-            {"r_total": int(r_total)},
-            k_folds=config.K_FOLDS,
-            sim_seed=sim_seed,
-            return_profile=True,
-            learner=config.DEFAULT_NUISANCE_LEARNER,
-        )
+        with _PeakRSSMonitor() as memory_monitor:
+            out = methods.run_ud(
+                data["X"],
+                data["W"],
+                data["Y_obs"],
+                data["pi_true"],
+                scenario_cfg["design"] == "rct",
+                {"r_total": int(r_total)},
+                k_folds=config.K_FOLDS,
+                sim_seed=sim_seed,
+                return_profile=True,
+                learner=config.DEFAULT_NUISANCE_LEARNER,
+            )
         tb = out.get("time_breakdown")
         if not isinstance(tb, dict):
             raise RuntimeError("run_ud(..., return_profile=True) must return time_breakdown dict.")
@@ -1066,6 +1356,11 @@ def run_efficiency_profile_experiment(
         for k in PROFILE_STEP_KEYS:
             record[k] = float(tb[k])
         record["total"] = float(tb["total"])
+        record["rss_before_mb"] = memory_monitor.baseline_bytes / (1024 ** 2)
+        record["peak_rss_mb"] = memory_monitor.peak_bytes / (1024 ** 2)
+        record["incremental_peak_rss_mb"] = (
+            memory_monitor.peak_bytes - memory_monitor.baseline_bytes
+        ) / (1024 ** 2)
         rows.append(record)
 
     rows_path = out_dir / "profile_rows.csv"
@@ -1085,6 +1380,8 @@ def run_efficiency_profile_experiment(
         for k in PROFILE_STEP_KEYS:
             sr[k] = float(r[k]) / tot
         sr["total"] = 1.0
+        for key in ("rss_before_mb", "peak_rss_mb", "incremental_peak_rss_mb"):
+            sr[key] = r[key]
         share_rows.append(sr)
 
     with shares_path.open("w", newline="", encoding="utf-8") as f:
@@ -1095,12 +1392,12 @@ def run_efficiency_profile_experiment(
     # Raw times boxplot
     fig, ax = plt.subplots(figsize=(10, 4))
     data_cols = [ [ float(r[k]) for r in rows ] for k in PROFILE_STEP_KEYS ]
-    ax.boxplot(data_cols, labels=PROFILE_STEP_KEYS, showmeans=True)
+    ax.boxplot(data_cols, tick_labels=PROFILE_STEP_KEYS, showmeans=True)
     ax.set_ylabel("Time (s)")
-    ax.set_title("UD-DML stage times (raw)")
     plt.xticks(rotation=35, ha="right")
     fig.tight_layout()
     fig.savefig(out_dir / "time_raw_boxplot.png", dpi=200)
+    fig.savefig(out_dir / "time_raw_boxplot.pdf")
     plt.close(fig)
 
     # Cumulative share boxplots (stacked-style diagnostic)
@@ -1119,15 +1416,19 @@ def run_efficiency_profile_experiment(
     ax.set_xticklabels([f"≤{k}" for k in PROFILE_STEP_KEYS], rotation=35, ha="right")
     ax.set_ylim(0.0, 1.05)
     ax.set_ylabel("Cumulative time share")
-    ax.set_title("Cumulative time share by pipeline stage (boxplots)")
     ax.axhline(1.0, color="gray", ls=":", lw=1)
     fig.tight_layout()
     fig.savefig(out_dir / "time_share_stacked_boxplot.png", dpi=200)
+    fig.savefig(out_dir / "time_share_stacked_boxplot.pdf")
     plt.close(fig)
 
     totals = [float(r["total"]) for r in rows]
     totals_sorted = sorted(totals)
     med_total = totals_sorted[len(totals_sorted) // 2]
+    med_peak_rss = float(np.median([float(r["peak_rss_mb"]) for r in rows]))
+    med_incremental_peak = float(
+        np.median([float(r["incremental_peak_rss_mb"]) for r in rows])
+    )
 
     med_share = {}
     mean_share = {}
@@ -1147,6 +1448,8 @@ def run_efficiency_profile_experiment(
         "",
         f"- **Scenario:** {scenario}, **n:** {n}, **r_total:** {r_total}, **replications:** {replications}",
         f"- **Median total runtime (s):** {med_total:.4f}",
+        f"- **Median peak RSS (MB):** {med_peak_rss:.1f}",
+        f"- **Median incremental peak RSS (MB):** {med_incremental_peak:.1f}",
         "",
         "## Median / mean time share by stage",
         "",
@@ -1178,6 +1481,8 @@ def run_efficiency_profile_experiment(
         f"{scenario} ($n={n_tex}$, $r_{{\\mathrm{{total}}}}={int(r_total)}$, "
         f"$B_\\gamma={int(B_gamma)}$, {int(replications)} Monte Carlo {rep_word}). "
         f"Median total elapsed time: ${med_total:.4f}$~s. "
+        f"Median peak RSS: ${med_peak_rss:.1f}$~MB; median incremental peak RSS: "
+        f"${med_incremental_peak:.1f}$~MB. "
         r"For each stage, \emph{Median} and \emph{Mean} are the median and mean, "
         r"over replications, of that stage's fraction of total runtime (in percent)."
     )
@@ -1363,10 +1668,12 @@ def run_bgamma_sensitivity_experiment(
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     xs = [int(s["B_gamma"]) for s in summary_rows]
+    ud_color = "#D55E00"
+    reference_color = "#009E73"
     ax1.plot(xs, [s["mean_runtime"] for s in summary_rows],
-             "o-", linewidth=2.4, markersize=8, label="Mean")
+             "o-", color=ud_color, linewidth=2.4, markersize=8, label="Mean")
     ax1.plot(xs, [s["median_runtime"] for s in summary_rows],
-             "s--", linewidth=2.4, markersize=8, label="Median")
+             "s--", color=ud_color, alpha=0.70, linewidth=2.4, markersize=8, label="Median")
     ax1.set_xlabel(r"$B_\gamma$")
     ax1.set_ylabel("Runtime (s)")
     ax1.set_title("Runtime vs generator budget")
@@ -1374,22 +1681,23 @@ def run_bgamma_sensitivity_experiment(
     ax1.grid(True, ls="--")
 
     ax2.plot(xs, [s["rmse"] for s in summary_rows],
-             "o-", color="C1", linewidth=2.4, markersize=8, label="RMSE")
+             "o-", color=ud_color, linewidth=2.4, markersize=8, label="RMSE")
     ax3 = ax2.twinx()
     ax3.plot(xs, [s["coverage_95"] for s in summary_rows],
-             "s--", color="C2", linewidth=2.4, markersize=8, label="Coverage")
+             "s--", color=reference_color, linewidth=2.4, markersize=8, label="Coverage")
     ax2.set_xlabel(r"$B_\gamma$")
-    ax2.set_ylabel("RMSE", color="C1")
-    ax3.set_ylabel("Coverage", color="C2")
+    ax2.set_ylabel("RMSE", color=ud_color)
+    ax3.set_ylabel("Coverage", color=reference_color)
     ax2.set_title(r"Precision metrics vs $B_\gamma$")
-    ax2.tick_params(axis="y", labelcolor="C1")
-    ax3.tick_params(axis="y", labelcolor="C2")
+    ax2.tick_params(axis="y", labelcolor=ud_color)
+    ax3.tick_params(axis="y", labelcolor=reference_color)
     h1, l1 = ax2.get_legend_handles_labels()
     h2, l2 = ax3.get_legend_handles_labels()
     ax2.legend(h1 + h2, l1 + l2, loc="best")
     ax2.grid(True, ls="--")
     fig.suptitle(f"{scenario}, n={n}, r={r_total}")
-    fig.savefig(out_dir / "bgamma_sensitivity_plot.png")
+    for ext in (".png", ".pdf"):
+        fig.savefig(out_dir / f"bgamma_sensitivity_plot{ext}")
     plt.close(fig)
 
     return out_dir
@@ -1415,7 +1723,7 @@ def run_experiment(exp_name, n_jobs=-1):
 
     scenarios, all_methods, experiments = config.get_experiments()
     exp_config = experiments[exp_name]
-    output_dir = Path(exp_config["base_dir"])
+    output_dir = _resolve_experiment_output_dir(exp_config["base_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_dir = output_dir / "checkpoints"
@@ -1594,7 +1902,12 @@ def run_experiment(exp_name, n_jobs=-1):
 
     results = list(combined_results.values())
 
-    print(f"\n-> Completed {len(results)} successful replications (including cached)")
+    successful_count = sum(res.get("status", "success") == "success" for res in results)
+    failure_count = len(results) - successful_count
+    print(
+        f"\n-> Completed {successful_count} successful replications "
+        f"and recorded {failure_count} failures (including cached)"
+    )
     legacy_results = results_file.with_suffix("")
     if legacy_results.exists():
         try:
@@ -1614,14 +1927,45 @@ def run_experiment(exp_name, n_jobs=-1):
     return results
 
 
-def run_all(experiments=None, n_jobs=-1, fast_demo=False):
+def run_all(
+    experiments=None,
+    n_jobs=-1,
+    fast_demo=False,
+    family_replications=None,
+    family_population_size=None,
+    family_r_total=None,
+    output_tag=None,
+):
     """Run all (or selected) config experiment families.
 
     Pre-main ``bgamma_sensitivity`` / ``efficiency_profile`` are disabled; see
     ``run_profiling_before_experiment_families``. Then runs the main experiment loop.
     """
-    global FAST_DEMO_MODE
+    global FAST_DEMO_MODE, EXPERIMENT_OUTPUT_TAG
     FAST_DEMO_MODE = fast_demo
+    override_values = {
+        "family_replications": family_replications,
+        "family_population_size": family_population_size,
+        "family_r_total": family_r_total,
+    }
+    for override_name, override_value in override_values.items():
+        if override_value is not None and int(override_value) <= 0:
+            raise ValueError(f"{override_name} must be positive when provided.")
+    if family_r_total is not None and int(family_r_total) % 2 != 0:
+        raise ValueError("family_r_total must be even for paired UD experiments.")
+    EXPERIMENT_FAMILY_OVERRIDES.update(
+        {
+            "n_replications": family_replications,
+            "population_size": family_population_size,
+            "r_total": family_r_total,
+        }
+    )
+    EXPERIMENT_OUTPUT_TAG = output_tag
+    if fast_demo and any(
+        value is not None
+        for value in (family_replications, family_population_size, family_r_total)
+    ):
+        raise ValueError("--fast-demo cannot be combined with family-level size overrides.")
     _, _, experiment_catalog = config.get_experiments()
     if experiments is None or len(experiments) == 0:
         experiments = list(experiment_catalog.keys())
@@ -1681,6 +2025,15 @@ def parse_args():
         help="UD / UNIF subsample budget r_total for --experiment runs (default: 1000).",
     )
     parser.add_argument(
+        "--standalone-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Output directory for --experiment runs. Use distinct demo and "
+            "submission directories to prevent accidental result mixing."
+        ),
+    )
+    parser.add_argument(
         "--experiments",
         nargs="*",
         metavar="NAME",
@@ -1693,12 +2046,44 @@ def parse_args():
         help="Number of parallel jobs (default: -1 for all available cores).",
     )
     parser.add_argument(
+        "--family-replications",
+        type=int,
+        default=None,
+        help="Override replications for each selected configured experiment family.",
+    )
+    parser.add_argument(
+        "--family-n",
+        type=int,
+        default=None,
+        help="Override population size for selected configured experiment families.",
+    )
+    parser.add_argument(
+        "--family-r-total",
+        type=int,
+        default=None,
+        help="Override non-FULL subsample budgets for selected experiment families.",
+    )
+    parser.add_argument(
+        "--output-tag",
+        type=str,
+        default=None,
+        help=(
+            "Append a tag to configured experiment output directories, keeping "
+            "pilot or validation runs separate from submission-scale results."
+        ),
+    )
+    parser.add_argument(
         "--fast-demo",
         action="store_true",
         help=(
             "Enable fast-demo mode (reduced grids/replications, dedicated output folder). "
             "If pre-main profiling is re-enabled, it uses FAST_DEMO_OVERRIDES replications."
         ),
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run the configured submission-scale experiment families.",
     )
     parser.add_argument(
         "--no-ud-disk-cache",
@@ -1717,6 +2102,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.fast_demo and args.full:
+        raise ValueError("Choose exactly one of --fast-demo or --full.")
     if args.no_ud_disk_cache:
         os.environ["UD_SKELETON_DISK_CACHE"] = "0"
     elif args.ud_disk_cache_dir:
@@ -1729,6 +2116,10 @@ def main():
             n=args.n,
             replications=args.replications,
             r_total=args.r_total,
+            output_root=(
+                Path(args.standalone_output_dir)
+                if args.standalone_output_dir else None
+            ),
         )
         print(f"efficiency_profile outputs -> {out.resolve()}")
         return
@@ -1738,11 +2129,23 @@ def main():
             n=args.n,
             replications=args.replications,
             r_total=args.r_total,
+            output_root=(
+                Path(args.standalone_output_dir)
+                if args.standalone_output_dir else None
+            ),
         )
         print(f"bgamma_sensitivity outputs -> {out.resolve()}")
         return
 
-    run_all(experiments=args.experiments, n_jobs=args.jobs, fast_demo=args.fast_demo)
+    run_all(
+        experiments=args.experiments,
+        n_jobs=args.jobs,
+        fast_demo=args.fast_demo,
+        family_replications=args.family_replications,
+        family_population_size=args.family_n,
+        family_r_total=args.family_r_total,
+        output_tag=args.output_tag,
+    )
 
 
 if __name__ == "__main__":

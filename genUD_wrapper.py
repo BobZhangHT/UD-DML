@@ -36,7 +36,12 @@ from typing import Optional, Sequence, Tuple
 import numpy as np
 
 
-_LIB_NAME = "genUD.dll" if os.name == "nt" else "libgenUD.so"
+if os.name == "nt":
+    _LIB_NAME = "genUD.dll"
+elif sys.platform == "darwin":
+    _LIB_NAME = "libgenUD.dylib"
+else:
+    _LIB_NAME = "libgenUD.so"
 _LIB_PATH = Path(__file__).with_name(_LIB_NAME)
 
 _LIB_LOCK = threading.Lock()

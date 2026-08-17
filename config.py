@@ -65,6 +65,7 @@ When the covariates are already uncorrelated and equi-variant, q = p.
 """
 
 UD_MAX_GENERATOR_CANDIDATES: int = 30
+GEFD_MONTE_CARLO_PAIRS: int = 20_000
 """Budget B_γ: maximum number of admissible power generators to evaluate (Algorithm 1).
 
 If the total number of admissible α exceeds B_γ, a random subset of size
@@ -72,10 +73,14 @@ B_γ is drawn and searched (quasi-optimal / budgeted search, Section 2.2).
 """
 
 UD_NEAREST_NEIGHBORS: int = 5
-"""Legacy parameter kept for config compatibility.
+"""Initial exact KD-tree candidate count used by legacy callers."""
 
-The main UD-DML path uses exact 1-NN matching *with* replacement in Z-space
-(Algorithm 1); this key is not used by ``methods.run_ud``.
+UD_MATCH_MAX_NEIGHBORS: int = 256
+"""Maximum exact KD-tree candidates per target for one-to-one matching.
+
+The sparse bipartite assignment doubles its candidate count until every
+skeleton point has a unique observation.  Reaching this cap raises an error
+instead of silently selecting the same original observation more than once.
 """
 
 UD_SKELETON_DISK_CACHE_DIR: Path | None = Path("ud_skeleton_cache")
@@ -172,7 +177,8 @@ def get_experiments():
         Keys are scenario names (e.g. ``'RCT-1'``); values contain
         ``data_gen_func``, ``params``, ``design``, and ``covariates``.
     all_methods : dict
-        Keys are method names (``'UD'``, ``'UNIF'``, ``'FULL'``); values
+        Keys are method names (``'UD'``, ``'UNIF'``, ``'STRAT-UNIF'``,
+        ``'SEP-UD'``, ``'FULL'``); values
         contain ``func`` and optional default ``params``.
     experiments : dict
         Keys are experiment identifiers; values describe the scenarios,
@@ -210,6 +216,8 @@ def get_experiments():
     all_methods = {
         "UD": {"func": methods.run_ud},
         "UNIF": {"func": methods.run_unif},
+        "STRAT-UNIF": {"func": methods.run_stratified_unif},
+        "SEP-UD": {"func": methods.run_sep_ud},
         "FULL": {"func": methods.run_full, "params": {"k_folds": K_FOLDS}},
     }
 
@@ -221,7 +229,7 @@ def get_experiments():
                 "for all three OBS scenarios (Paper Figure 1)."
             ),
             "scenarios": list(scenarios.keys()),
-            "methods": ["UD", "UNIF"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"],
             "base_dir": "./simulation_results/subsample_size_grid",
             "params": {
                 "r_totals": SUBSAMPLE_TOTALS,
@@ -238,7 +246,7 @@ def get_experiments():
                 "propensity coefficient strength c (Paper Figure 2 + Table 1)."
             ),
             "scenarios": ["OBS-3-overlap"],
-            "methods": ["UD", "UNIF"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"],
             "base_dir": "./simulation_results/overlap_gradient",
             "params": {
                 "overlap_strengths": OVERLAP_STRENGTH_GRID,
@@ -256,7 +264,7 @@ def get_experiments():
                 "(Paper Table 2)."
             ),
             "scenarios": list(scenarios.keys()),
-            "methods": ["UD", "UNIF"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"],
             "base_dir": "./simulation_results/double_robustness",
             "params": {
                 "misspecification_scenarios": ROBUSTNESS_MISSPECIFICATIONS,
@@ -274,7 +282,7 @@ def get_experiments():
                 "subsample budgets, with bias-variance decomposition (Paper Table 3)."
             ),
             "scenarios": list(scenarios.keys()),
-            "methods": ["UD", "UNIF", "FULL"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD", "FULL"],
             "base_dir": "./simulation_results/population_scaling",
             "params": {
                 "population_sizes": POPULATION_SIZE_GRID,
@@ -284,16 +292,16 @@ def get_experiments():
                 "n_replications": DEFAULT_REPLICATIONS,
             },
         },
-        # ── Exp 5: Asymptotic normality + covariate balance (post-process) ──
+        # ── Exp 5: Distributional and covariate-balance diagnostics ──
         # Uses raw results from Exp 1 (r=5000, OBS-3). No extra simulation needed.
-        # Generates: Q-Q normality plot (Figure 3), SMD love plot (Figure 4).
+        # Generates the propensity-support diagnostic used as Figure 3.
         "experiment_visualization": {
             "description": (
-                "Propensity density, Q-Q normality, and SMD love plot "
-                "diagnostics (Paper Figures 3-4). Single rep for propensity viz."
+                "Propensity-support diagnostic for the full data and all four "
+                "working-sample methods (Paper Figure 3)."
             ),
             "scenarios": list(scenarios.keys()),
-            "methods": ["UD", "UNIF"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"],
             "base_dir": "./simulation_results/visualization",
             "params": {
                 "r_total": 5_000,
@@ -302,6 +310,25 @@ def get_experiments():
                 "n_estimators": LGBM_N_ESTIMATORS,
                 "k_folds": K_FOLDS,
                 "n_replications": 1,
+            },
+        },
+        # Diagnostic baselines requested during review.  This family reuses
+        # existing DGPs and isolates treatment balance (STRAT-UNIF) from the
+        # pooled/common-skeleton component (SEP-UD).
+        "experiment_diagnostic_baselines": {
+            "description": (
+                "Diagnostic comparison of UD, balanced random subsampling, "
+                "and separate-arm uniform designs on OBS-2 and OBS-3."
+            ),
+            "scenarios": ["OBS-2", "OBS-3"],
+            "methods": ["UNIF", "STRAT-UNIF", "SEP-UD", "UD"],
+            "base_dir": "./simulation_results/diagnostic_baselines",
+            "params": {
+                "r_total": 5_000,
+                "population_size": N_POPULATION,
+                "n_estimators": LGBM_N_ESTIMATORS,
+                "k_folds": K_FOLDS,
+                "n_replications": DEFAULT_REPLICATIONS,
             },
         },
     }
